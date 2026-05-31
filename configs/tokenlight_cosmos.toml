@@ -1,0 +1,60 @@
+[base]
+provider = "cosmos_unirelight"
+repo_path = "code/repos/unirelight"
+checkpoint_path = "code/repos/unirelight/checkpoints/UniRelight/model.pt"
+config_name = "unirelight_cosmos_f57_480p"
+net_family = "faditv2_7b"
+use_unirelight_relighting_conditioner = false
+init_backbone = true
+
+[vae]
+adapter = "cosmos_unirelight"
+image_size = 960
+latent_channels = 16
+latent_size = 120
+spatial_compression = 8
+scaling_factor = 1.0
+repo_path = "code/repos/unirelight"
+encoder_path = "code/repos/unirelight/checkpoints/Cosmos-Tokenize1-CV8x8x8-720p/encoder.jit"
+decoder_path = "code/repos/unirelight/checkpoints/Cosmos-Tokenize1-CV8x8x8-720p/decoder.jit"
+mean_std_path = "code/repos/unirelight/checkpoints/Cosmos-Tokenize1-CV8x8x8-720p/image_mean_std.pt"
+
+[model]
+hidden_dim = 4096
+depth = 28
+num_heads = 32
+mlp_ratio = 4.0
+patch_size = 2
+dropout = 0.0
+source = "cosmos_faditv2_tokenlight"
+block_config = "FA-CA-MLP"
+use_adaln_lora = true
+adaln_lora_dim = 256
+crossattn_emb_channels = 4096
+null_crossattn_tokens = 2
+timestep_scale = 1000.0
+
+[tokenizer]
+fourier_features = 512
+fourier_sigma = 5.0
+mlp_hidden_dim = 4096
+
+[training]
+precision = "bf16"
+global_batch_size = 160
+steps = 15000
+learning_rate = 1e-5
+weight_decay = 0.01
+adam_beta1 = 0.9
+adam_beta2 = 0.95
+light_dropout_prob = 0.1
+grad_clip_norm = 1.0
+save_every = 1000
+
+[sampler]
+steps = 50
+cfg_scale = 2.0
+
+[data]
+linear_rgb = true
+tone_mapper = "reinhard"

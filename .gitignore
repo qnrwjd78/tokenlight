@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Environments
+.env
+.venv/
+venv/
+env/
+
+# Local caches
+.cache/
+.huggingface/
+
+# External repositories and mounted workspace content
+repos/
+code/repos/
+
+# Data, checkpoints, outputs
+data/
+runs/
+outputs/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.jit
+*.onnx
+*.exr
+*.hdr
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
+wandb/

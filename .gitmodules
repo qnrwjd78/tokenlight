@@ -1,0 +1,7 @@
+[submodule "repos/unirelight"]
+	path = repos/unirelight
+	url = https://github.com/nv-tlabs/UniRelight.git
+	ignore = dirty
+[submodule "repos/relighting_dataset"]
+	path = repos/relighting_dataset
+	url = https://github.com/qnrwjd78/relighting_dataset.git

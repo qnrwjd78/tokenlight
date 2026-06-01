@@ -1,0 +1,85 @@
+{
+  "output_root": "/workspace/data/tokenlight_synthetic",
+  "object_manifest": "manifests/objects.txt",
+  "hdri_manifest": "manifests/hdris.txt",
+  "fixture_scene_manifest": "manifests/fixture_scenes.jsonl",
+  "scene_count": 10,
+  "seed": 20260524,
+  "render": {
+    "engine": "CYCLES",
+    "device": "GPU",
+    "resolution": 960,
+    "samples": 128,
+    "denoise": true,
+    "tile_size": 256,
+    "exr_color_depth": "16",
+    "view_transform": "Standard",
+    "look": "None",
+    "exposure": 0.0,
+    "gamma": 1.0
+  },
+  "camera": {
+    "fov_degrees": 39.6,
+    "distance_range": [2.8, 3.6],
+    "azimuth_degrees_range": [-35.0, 35.0],
+    "elevation_degrees_range": [4.0, 24.0],
+    "look_at_jitter": 0.06
+  },
+  "object": {
+    "target_size": 1.2,
+    "primitive_fallbacks": ["sphere", "cube", "torus", "cylinder", "cone"],
+    "randomize_materials": true,
+    "material_families": ["matte", "plastic", "glossy", "metal"],
+    "allow_transparent_materials": false
+  },
+  "layout": {
+    "ground": true,
+    "ground_size": 8.0,
+    "wall_probability": 0.7,
+    "corner_probability": 0.25,
+    "wall_distance": 1.8,
+    "wall_height": 3.0,
+    "randomize_receiver_material": true
+  },
+  "ambient": {
+    "hdri_strength_range": [0.8, 1.2],
+    "hdri_rotation_random": true,
+    "fallback_color": [0.78, 0.78, 0.78],
+    "fallback_strength": 0.8
+  },
+  "canonical": {
+    "center": [0.0, 0.0, 0.6],
+    "reference_object_size": 1.2,
+    "light_volume_radius": 1.5,
+    "z_scale": 1.2,
+    "position_range": {
+      "x": [-1.0, 1.0],
+      "y": [-1.0, 1.0],
+      "z": [0.05, 1.25]
+    }
+  },
+  "spatial": {
+    "enabled": true,
+    "positions_per_scene": 64,
+    "sampling": "stratified_random",
+    "fixed_debug_positions_first": true,
+    "base_energy": 500.0,
+    "fixed_radius": 0.06,
+    "color": [1.0, 1.0, 1.0]
+  },
+  "diffuse": {
+    "enabled": true,
+    "spread_count": 6,
+    "constant_ambient_color": [0.72, 0.72, 0.72],
+    "constant_ambient_strength": 0.35,
+    "area_light_canonical_position": [-0.45, -0.65, 1.15],
+    "area_light_energy": 650.0,
+    "spread_degrees_range": [6.0, 70.0],
+    "normalize_spread_to": [-1.0, 1.0]
+  },
+  "fixtures": {
+    "enabled": true,
+    "max_non_selected_fixtures_in_ambient": 5,
+    "render_if_manifest_exists": true
+  }
+}

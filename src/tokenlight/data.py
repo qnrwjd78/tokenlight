@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
 import numpy as np
@@ -44,6 +45,13 @@ def resolve_path(root: Path, value: str | None) -> Path | None:
     if path.is_absolute():
         return path
     return root / path
+
+
+def resolve_absolute_path(value: str | Path, base: str | Path = ".") -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        path = Path(base) / path
+    return path.resolve()
 
 
 class TokenLightManifestDataset(Dataset):
@@ -192,6 +200,190 @@ class DiffuseSpreadDataset(Dataset):
             }
         )
         return {"source": source, "target": target, "attrs": attrs}
+
+
+def _float_or_nan(value: Any) -> float:
+    if value is None:
+        return float("nan")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _triple(value: Any) -> tuple[float, float, float]:
+    if value is None:
+        return (float("nan"), float("nan"), float("nan"))
+    values = list(value)
+    values = (values + [float("nan"), float("nan"), float("nan")])[:3]
+    return _float_or_nan(values[0]), _float_or_nan(values[1]), _float_or_nan(values[2])
+
+
+class RelightingComponentAdapterDataset(Dataset):
+    """Adapter for `repos/relighting_dataset` component samples.
+
+    The external repo synthesizes pairs as:
+
+      {"input": CHW [-1,1], "target": CHW [-1,1], "condition": {...}}
+
+    TokenLight training expects:
+
+      {"source": CHW, "target": CHW, "attrs": {...}, "mask": optional CHW}
+
+    This adapter keeps the external repo untouched and performs only the schema
+    translation needed by this training code.
+    """
+
+    def __init__(
+        self,
+        component_root: str | Path,
+        repo_path: str | Path = "repos/relighting_dataset",
+        length: int = 100_000,
+        modes: tuple[str, ...] = ("spatial", "ambient", "diffuse", "fixture"),
+        seed: int = 1234,
+        max_lights: int = 1,
+        image_range: str = "minus_one_one",
+        include_masks: bool = True,
+        include_object_masks: bool = True,
+    ) -> None:
+        self.root = resolve_absolute_path(component_root)
+        self.repo_path = resolve_absolute_path(repo_path)
+        self.image_range = image_range
+        self.include_masks = bool(include_masks)
+        self.include_object_masks = bool(include_object_masks)
+        if self.image_range not in {"minus_one_one", "zero_one"}:
+            raise ValueError("image_range must be 'minus_one_one' or 'zero_one'")
+        if int(max_lights) != 1:
+            raise ValueError(
+                "The current TokenLight tokenizer has one x/y/z/r/g/b/lambda/d slot. "
+                "Use max_lights=1 until multi-light token packing is implemented."
+            )
+        if not self.repo_path.exists():
+            raise FileNotFoundError(f"relighting_dataset repo not found: {self.repo_path}")
+
+        repo_str = str(self.repo_path)
+        if repo_str not in sys.path:
+            sys.path.insert(0, repo_str)
+        try:
+            from tokenlight_dataset.component_dataset import TokenLightComponentDataset
+        except Exception as exc:  # pragma: no cover - requires external repo
+            raise RuntimeError(
+                "Could not import tokenlight_dataset from repos/relighting_dataset. "
+                "Check --component-repo and the container PYTHONPATH."
+            ) from exc
+
+        self.dataset = TokenLightComponentDataset(
+            root=str(self.root),
+            length=int(length),
+            modes=tuple(modes),
+            seed=int(seed),
+            max_lights=1,
+            return_torch=True,
+        )
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        sample = self.dataset[index]
+        source = self._convert_image(sample["input"].float())
+        target = self._convert_image(sample["target"].float())
+        condition = dict(sample["condition"])
+        item: dict[str, Any] = {
+            "source": source,
+            "target": target,
+            "attrs": self.attrs_from_condition(condition),
+        }
+        mask = self._load_mask(condition)
+        if mask is not None:
+            item["mask"] = mask
+        return item
+
+    def _convert_image(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.image_range == "zero_one":
+            return ((tensor + 1.0) * 0.5).clamp(0.0, 1.0).contiguous()
+        return tensor.contiguous()
+
+    def _load_mask(self, condition: dict[str, Any]) -> torch.Tensor | None:
+        if not self.include_masks:
+            return None
+        scene_id = condition.get("scene_id")
+        if not scene_id:
+            return None
+        scene_dir = self.root / "scenes" / str(scene_id)
+        candidates: list[Path] = []
+        if condition.get("mask"):
+            candidates.append(scene_dir / str(condition["mask"]))
+        if self.include_object_masks:
+            candidates.append(scene_dir / "masks" / "object_mask.png")
+        for path in candidates:
+            if path.exists():
+                mask = load_tensor_image(path).float()
+                if self.image_range == "minus_one_one":
+                    mask = mask * 2.0 - 1.0
+                return mask.contiguous()
+        return None
+
+    @staticmethod
+    def attrs_from_condition(condition: dict[str, Any]) -> dict[str, float]:
+        task = condition.get("task")
+        attrs: dict[str, float] = {}
+
+        if task == "spatial":
+            attrs["a"] = _float_or_nan(condition.get("ambient_scale"))
+            lights = list(condition.get("lights") or [])
+            if lights:
+                light = lights[0]
+                x, y, z = _triple(light.get("position"))
+                r, g, b = _triple(light.get("color"))
+                attrs.update(
+                    {
+                        "x": x,
+                        "y": y,
+                        "z": z,
+                        "r": r,
+                        "g": g,
+                        "b": b,
+                        "lambda": _float_or_nan(light.get("intensity")),
+                        "d": _float_or_nan(light.get("radius")),
+                    }
+                )
+            return attrs
+
+        if task == "ambient":
+            attrs["a"] = _float_or_nan(condition.get("ambient_scale_out", condition.get("ambient_scale_delta")))
+            return attrs
+
+        if task == "diffuse":
+            r, g, b = _triple(condition.get("color"))
+            attrs.update(
+                {
+                    "a": _float_or_nan(condition.get("ambient_scale")),
+                    "dg": _float_or_nan(condition.get("spread_delta")),
+                    "d": _float_or_nan(condition.get("spread_out")),
+                    "r": r,
+                    "g": g,
+                    "b": b,
+                    "lambda": _float_or_nan(condition.get("intensity")),
+                }
+            )
+            return attrs
+
+        if task == "fixture":
+            r, g, b = _triple(condition.get("color"))
+            attrs.update(
+                {
+                    "a": _float_or_nan(condition.get("ambient_scale")),
+                    "r": r,
+                    "g": g,
+                    "b": b,
+                    "lambda": _float_or_nan(condition.get("intensity")),
+                    "t": _float_or_nan(condition.get("transition_on")),
+                }
+            )
+            return attrs
+
+        return attrs
 
 
 def collate_tokenlight(batch: list[dict[str, Any]]) -> dict[str, Any]:

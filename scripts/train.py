@@ -14,7 +14,12 @@ from tqdm import tqdm
 from tokenlight.checkpoint import load_checkpoint, load_compatible_checkpoint, save_checkpoint
 from tokenlight.config import load_config
 from tokenlight.cosmos_base import assert_tokenlight_first_base_config, inspect_cosmos_base
-from tokenlight.data import TokenLightManifestDataset, collate_tokenlight, move_batch_to_device
+from tokenlight.data import (
+    RelightingComponentAdapterDataset,
+    TokenLightManifestDataset,
+    collate_tokenlight,
+    move_batch_to_device,
+)
 from tokenlight.factory import build_model
 from tokenlight.flow import flow_matching_loss
 from tokenlight.vae import build_vae
@@ -73,8 +78,17 @@ def setup_distributed(args):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
-    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--dataset-type", choices=["manifest", "relighting-components"], default="manifest")
+    parser.add_argument("--manifest", default="")
     parser.add_argument("--data-root", default=".")
+    parser.add_argument("--component-root", default="")
+    parser.add_argument("--component-repo", default="repos/relighting_dataset")
+    parser.add_argument("--component-modes", nargs="+", default=["spatial", "ambient", "diffuse", "fixture"])
+    parser.add_argument("--component-length", type=int, default=100_000)
+    parser.add_argument("--component-seed", type=int, default=1234)
+    parser.add_argument("--max-lights", type=int, default=1)
+    parser.add_argument("--image-range", choices=["minus_one_one", "zero_one"], default="minus_one_one")
+    parser.add_argument("--no-masks", action="store_true")
     parser.add_argument("--output", required=True)
     parser.add_argument("--resume", default="")
     parser.add_argument("--init-checkpoint", default="")
@@ -84,6 +98,24 @@ def parse_args():
     parser.add_argument("--local-rank", type=int, default=0)
     parser.add_argument("--fsdp", action="store_true")
     return parser.parse_args()
+
+
+def build_dataset(args):
+    if args.dataset_type == "manifest":
+        if not args.manifest:
+            raise ValueError("--manifest is required when --dataset-type=manifest")
+        return TokenLightManifestDataset(args.manifest, root=args.data_root)
+    component_root = args.component_root or args.data_root
+    return RelightingComponentAdapterDataset(
+        component_root=component_root,
+        repo_path=args.component_repo,
+        length=args.component_length,
+        modes=tuple(args.component_modes),
+        seed=args.component_seed,
+        max_lights=args.max_lights,
+        image_range=args.image_range,
+        include_masks=not args.no_masks,
+    )
 
 
 def main():
@@ -145,7 +177,7 @@ def main():
     if args.resume:
         start_step = load_checkpoint(args.resume, model, optimizer=optimizer, strict=True)
 
-    dataset = TokenLightManifestDataset(args.manifest, root=args.data_root)
+    dataset = build_dataset(args)
     if cfg.training.global_batch_size % world_size != 0:
         raise ValueError(
             f"global_batch_size={cfg.training.global_batch_size} must be divisible by world_size={world_size}"

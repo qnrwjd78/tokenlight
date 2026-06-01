@@ -3,6 +3,7 @@ import torch
 from tokenlight.canonical import transform_camera_light
 from tokenlight.color import compose_relight
 from tokenlight.config import ModelConfig, TokenizerConfig, VAEConfig
+from tokenlight.data import RelightingComponentAdapterDataset
 from tokenlight.flow import flow_matching_loss
 from tokenlight.model import TokenLightDiT
 from tokenlight.sampler import TokenLightSampler
@@ -37,6 +38,34 @@ def test_compose_relight_shape():
     out = compose_relight(ambient, contrib, 0.8, 0.5, torch.tensor([1.0, 0.5, 0.25]))
     assert out.shape == ambient.shape
     assert out.min() >= 0 and out.max() <= 1
+
+
+def test_relighting_component_condition_mapping():
+    attrs = RelightingComponentAdapterDataset.attrs_from_condition(
+        {
+            "task": "spatial",
+            "ambient_scale": 0.7,
+            "lights": [
+                {
+                    "position": [0.1, -0.2, 0.8],
+                    "color": [1.0, 0.9, 0.7],
+                    "intensity": 0.5,
+                    "radius": 0.06,
+                }
+            ],
+        }
+    )
+    assert attrs == {
+        "a": 0.7,
+        "x": 0.1,
+        "y": -0.2,
+        "z": 0.8,
+        "r": 1.0,
+        "g": 0.9,
+        "b": 0.7,
+        "lambda": 0.5,
+        "d": 0.06,
+    }
 
 
 def test_model_flow_and_sampler_smoke():

@@ -1,7 +1,7 @@
 [base]
 provider = "cosmos_unirelight"
-repo_path = "code/repos/unirelight"
-checkpoint_path = "code/repos/unirelight/checkpoints/UniRelight/model.pt"
+repo_path = "repos/unirelight"
+checkpoint_path = "repos/unirelight/checkpoints/UniRelight/model.pt"
 config_name = "unirelight_cosmos_f57_480p"
 net_family = "faditv2_7b"
 use_unirelight_relighting_conditioner = false
@@ -14,10 +14,10 @@ latent_channels = 16
 latent_size = 120
 spatial_compression = 8
 scaling_factor = 1.0
-repo_path = "code/repos/unirelight"
-encoder_path = "code/repos/unirelight/checkpoints/Cosmos-Tokenize1-CV8x8x8-720p/encoder.jit"
-decoder_path = "code/repos/unirelight/checkpoints/Cosmos-Tokenize1-CV8x8x8-720p/decoder.jit"
-mean_std_path = "code/repos/unirelight/checkpoints/Cosmos-Tokenize1-CV8x8x8-720p/image_mean_std.pt"
+repo_path = "repos/unirelight"
+encoder_path = "repos/unirelight/checkpoints/Cosmos-Tokenize1-CV8x8x8-720p/encoder.jit"
+decoder_path = "repos/unirelight/checkpoints/Cosmos-Tokenize1-CV8x8x8-720p/decoder.jit"
+mean_std_path = "repos/unirelight/checkpoints/Cosmos-Tokenize1-CV8x8x8-720p/image_mean_std.pt"
 
 [model]
 hidden_dim = 4096

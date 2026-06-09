@@ -128,7 +128,7 @@ class TokenLightWanTrainingModule(DiffusionTrainingModule):  # noqa: F405
         lora_checkpoint=None,
         preset_lora_path=None,
         preset_lora_model=None,
-        use_gradient_checkpointing=True,
+        use_gradient_checkpointing=False,
         use_gradient_checkpointing_offload=False,
         extra_inputs=None,
         fp8_models=None,
@@ -151,13 +151,6 @@ class TokenLightWanTrainingModule(DiffusionTrainingModule):  # noqa: F405
         tokenlight_mask_tokens=True,
     ):
         super().__init__()
-        if not use_gradient_checkpointing:
-            warnings.warn(
-                "Gradient checkpointing is disabled; 1280x704 Wan training needs it, so it will be enabled.",
-                stacklevel=2,
-            )
-            use_gradient_checkpointing = True
-
         model_configs = self.parse_model_configs(
             model_paths,
             model_id_with_origin_paths,
@@ -356,6 +349,7 @@ def wan_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="TokenLight Wan2.2-TI2V-5B trainer.")
     parser = add_general_config(parser)  # noqa: F405
     parser = add_video_size_config(parser)  # noqa: F405
+    parser.set_defaults(use_gradient_checkpointing=False, use_gradient_checkpointing_offload=False)
     parser.add_argument("--tokenizer_path", type=str, default=None)
     parser.add_argument("--audio_processor_path", type=str, default=None)
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0)

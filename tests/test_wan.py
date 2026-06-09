@@ -1,6 +1,12 @@
 import torch
 
-from tokenlight.wan import TokenLightAttributeTokenEncoder, attrs_json, light_attrs_to_prompt, parse_attrs_json
+from tokenlight.wan import (
+    TokenLightAttributeTokenEncoder,
+    attrs_json,
+    gradient_checkpoint_forward_compatible,
+    light_attrs_to_prompt,
+    parse_attrs_json,
+)
 
 
 def test_prompt_hides_numeric_values_by_default():
@@ -31,3 +37,17 @@ def test_light_tokens_are_dit_tokens_with_null_dropout():
 
     dropped = encoder(attrs, drop_light=True)
     assert torch.all(dropped == -1)
+
+
+def test_zero3_checkpoint_path_handles_inputs_without_grad():
+    block = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.SiLU(), torch.nn.Linear(4, 4))
+    for param in block.parameters():
+        param.ds_id = 0
+
+    x = torch.randn(2, 4)
+    out = gradient_checkpoint_forward_compatible(block, True, True, x)
+    out.square().mean().backward()
+
+    assert x.requires_grad is False
+    assert block[0].weight.grad is not None
+    assert block[2].weight.grad is not None

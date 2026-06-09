@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 
 LIGHT_TOKEN_NAMES: tuple[str, ...] = ("a", "dg", "x", "y", "z", "r", "g", "b", "lambda", "d", "t")
@@ -327,6 +328,45 @@ def _clean_prefix_t_mod(dit: nn.Module, prefix_len: int, batch: int, dtype: torc
     return clean.expand(batch, -1, -1, -1).contiguous()
 
 
+def _has_deepspeed_zero3_params(module: nn.Module) -> bool:
+    return any(hasattr(param, "ds_id") for param in module.parameters(recurse=True))
+
+
+def _with_checkpoint_input_grad(inputs: tuple[Any, ...]) -> tuple[Any, ...]:
+    if any(isinstance(item, torch.Tensor) and item.requires_grad for item in inputs):
+        return inputs
+    patched = list(inputs)
+    for index, item in enumerate(patched):
+        if isinstance(item, torch.Tensor) and torch.is_floating_point(item):
+            patched[index] = item.detach().requires_grad_(True)
+            return tuple(patched)
+    return inputs
+
+
+def gradient_checkpoint_forward_compatible(
+    module: nn.Module,
+    use_gradient_checkpointing: bool,
+    use_gradient_checkpointing_offload: bool,
+    *inputs: Any,
+) -> Any:
+    if not use_gradient_checkpointing:
+        return module(*inputs)
+    if _has_deepspeed_zero3_params(module):
+        # DiffSynth's regular checkpoint path uses PyTorch non-reentrant checkpointing.
+        # With ZeRO-3, recompute-time saved tensors can observe partitioned params as
+        # shape [0], so use the reentrant path for ZeRO-managed modules.
+        return checkpoint(module, *_with_checkpoint_input_grad(inputs), use_reentrant=True)
+
+    from diffsynth.core.gradient import gradient_checkpoint_forward
+
+    return gradient_checkpoint_forward(
+        module,
+        use_gradient_checkpointing,
+        use_gradient_checkpointing_offload,
+        *inputs,
+    )
+
+
 def tokenlight_model_fn_wan_video(
     *,
     dit: nn.Module,
@@ -357,7 +397,6 @@ def tokenlight_model_fn_wan_video(
 
     del kwargs
     from einops import rearrange
-    from diffsynth.core.gradient import gradient_checkpoint_forward
     from diffsynth.models.wan_video_dit import sinusoidal_embedding_1d
 
     if latents is None or timestep is None or context is None:
@@ -452,7 +491,7 @@ def tokenlight_model_fn_wan_video(
         freqs = target_freqs
 
     for block in dit.blocks:
-        x = gradient_checkpoint_forward(
+        x = gradient_checkpoint_forward_compatible(
             block,
             use_gradient_checkpointing,
             use_gradient_checkpointing_offload,

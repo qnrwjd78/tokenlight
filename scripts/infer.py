@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from pathlib import Path
@@ -28,20 +29,36 @@ from tokenlight.wan import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TokenLight Wan2.2 TI2V inference with numeric light tokens.")
     parser.add_argument("--source", required=True, help="Source image I.")
-    parser.add_argument("--attrs", required=True, help="JSON file or inline JSON with TokenLight attrs.")
+    parser.add_argument("--attrs", default="", help="JSON file or inline JSON with TokenLight attrs.")
+    parser.add_argument("--light_id", type=int, default=None, help="Spatial light number resolved from dataset metadata.")
+    parser.add_argument(
+        "--dataset_metadata_path",
+        default="",
+        help="Optional metadata.csv path used to resolve --light_id. Auto-detected from --source when omitted.",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--prompt", default="")
     parser.add_argument("--task", choices=["spatial", "ambient", "diffuse", "fixture", "relighting"], default="relighting")
     parser.add_argument("--model_id_with_origin_paths", default="")
     parser.add_argument("--model_paths", default=None)
     parser.add_argument("--tokenizer_path", default=None)
+    parser.add_argument(
+        "--checkpoint",
+        default="",
+        help="Combined training checkpoint containing LoRA and/or light_encoder weights.",
+    )
+    parser.add_argument(
+        "--lora_checkpoint",
+        default="",
+        help="Optional LoRA checkpoint. Defaults to --checkpoint when present.",
+    )
     parser.add_argument("--tokenlight_light_checkpoint", default="")
     parser.add_argument("--mask", default="", help="Optional object/edit mask image for TokenLight mask latent tokens.")
     parser.add_argument("--height", type=int, default=704)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--num_frames", type=int, default=1)
     parser.add_argument("--num_inference_steps", type=int, default=50)
-    parser.add_argument("--cfg_scale", type=float, default=2.0)
+    parser.add_argument("--cfg_scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--fps", type=int, default=16)
     parser.add_argument("--device", default="cuda")
@@ -63,7 +80,17 @@ def parse_model_configs(args) -> list[ModelConfig]:
         if isinstance(payload, str):
             payload = [payload]
         if isinstance(payload, list):
-            return [ModelConfig(item) if isinstance(item, str) else ModelConfig(**item) for item in payload]
+            configs = []
+            for item in payload:
+                if isinstance(item, str):
+                    configs.append(ModelConfig(item))
+                elif isinstance(item, list):
+                    configs.append(ModelConfig(path=item))
+                elif isinstance(item, dict):
+                    configs.append(ModelConfig(**item))
+                else:
+                    raise ValueError(f"Unsupported --model_paths entry type: {type(item).__name__}")
+            return configs
         raise ValueError("--model_paths must be a JSON string or list")
     value = args.model_id_with_origin_paths or (
         "Wan-AI/Wan2.2-TI2V-5B:diffusion_pytorch_model*.safetensors,"
@@ -84,7 +111,113 @@ def load_attrs(value: str) -> dict[str, float]:
     return parse_attrs_json(value)
 
 
-def load_light_encoder(args, pipe) -> TokenLightAttributeTokenEncoder:
+def resolve_metadata_path(args) -> Path:
+    if args.dataset_metadata_path:
+        return Path(args.dataset_metadata_path)
+    source_path = Path(args.source)
+    for parent in (source_path.parent, *source_path.parents):
+        candidate = parent / "metadata.csv"
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        "Could not auto-detect metadata.csv from --source. Pass --dataset_metadata_path explicitly."
+    )
+
+
+def load_attrs_from_light_id(args) -> dict[str, float]:
+    if args.task != "spatial":
+        raise ValueError("--light_id is currently only supported for --task spatial")
+    metadata_path = resolve_metadata_path(args)
+    source_name = Path(args.source).name
+    target_names = {
+        f"spatial_light_{int(args.light_id):03d}.png",
+        f"spatial_light_{int(args.light_id):03d}.mp4",
+    }
+    with metadata_path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            if row.get("task") != "spatial":
+                continue
+            if Path(row.get("input_image", "")).name != source_name:
+                continue
+            if Path(row.get("video", "")).name not in target_names:
+                continue
+            attrs = parse_attrs_json(row["attrs_json"])
+            print(
+                f"Resolved light_id {int(args.light_id):03d} for {source_name} "
+                f"from {Path(row['video']).name}: {json.dumps(attrs, sort_keys=True)}"
+            )
+            return attrs
+    raise ValueError(
+        f"Could not find spatial light {int(args.light_id):03d} for source {source_name} in {metadata_path}"
+    )
+
+
+def resolve_attrs(args) -> dict[str, float]:
+    if args.light_id is not None:
+        return load_attrs_from_light_id(args)
+    if args.attrs:
+        return load_attrs(args.attrs)
+    raise ValueError("Provide either --attrs or --light_id")
+
+
+def load_checkpoint_state(path: str) -> dict[str, torch.Tensor]:
+    try:
+        from safetensors.torch import load_file
+
+        state = load_file(path)
+    except Exception:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+    if "state_dict" in state:
+        state = state["state_dict"]
+    return state
+
+
+def resolve_light_checkpoint_path(args) -> str:
+    return args.tokenlight_light_checkpoint or args.checkpoint
+
+
+def resolve_lora_checkpoint_path(args) -> str:
+    return args.lora_checkpoint or args.checkpoint
+
+
+def _strip_prefix(text: str, prefix: str) -> str:
+    if text.startswith(prefix):
+        return text[len(prefix) :]
+    return text
+
+
+def extract_light_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    light_state = {}
+    for key, value in state.items():
+        key = _strip_prefix(key, "module.")
+        if key.startswith("light_encoder."):
+            light_state[key.removeprefix("light_encoder.")] = value
+    return light_state
+
+
+def extract_lora_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    lora_state = {}
+    for key, value in state.items():
+        key = _strip_prefix(key, "module.")
+        key = _strip_prefix(key, "pipe.dit.")
+        if ".lora_A." in key or ".lora_B." in key or key.endswith(".lora_A.weight") or key.endswith(".lora_B.weight"):
+            lora_state[key] = value
+    return lora_state
+
+
+def maybe_load_lora(args, pipe, state: dict[str, torch.Tensor] | None) -> bool:
+    if state is None:
+        return False
+    lora_state = extract_lora_state(state)
+    if not lora_state:
+        return False
+    pipe.load_lora(pipe.dit, state_dict=lora_state, alpha=1.0)
+    print(f"Loaded {len(lora_state)} LoRA tensors from checkpoint.")
+    return True
+
+
+def load_light_encoder(args, pipe, state: dict[str, torch.Tensor] | None = None) -> TokenLightAttributeTokenEncoder:
     token_dim = args.tokenlight_token_dim if args.tokenlight_token_dim > 0 else int(pipe.dit.dim)
     encoder = TokenLightAttributeTokenEncoder(
         token_dim=token_dim,
@@ -92,22 +225,15 @@ def load_light_encoder(args, pipe) -> TokenLightAttributeTokenEncoder:
         fourier_sigma=args.tokenlight_fourier_sigma,
         hidden_dim=args.tokenlight_mlp_hidden_dim,
     ).to(device=pipe.device, dtype=pipe.torch_dtype)
-    if args.tokenlight_light_checkpoint:
-        try:
-            from safetensors.torch import load_file
-
-            state = load_file(args.tokenlight_light_checkpoint)
-        except Exception:
-            state = torch.load(args.tokenlight_light_checkpoint, map_location="cpu", weights_only=False)
-        if "state_dict" in state:
-            state = state["state_dict"]
-        light_state = {}
-        for key, value in state.items():
-            if key.startswith("light_encoder."):
-                light_state[key.removeprefix("light_encoder.")] = value
-        if not light_state:
+    if state is not None:
+        light_state = extract_light_state(state)
+        if not light_state and any(
+            key.startswith("fourier.") or key.startswith("value_mlp.") for key in state
+        ):
             light_state = state
-        encoder.load_state_dict(light_state, strict=False)
+        if light_state:
+            encoder.load_state_dict(light_state, strict=False)
+            print(f"Loaded {len(light_state)} light encoder tensors from checkpoint.")
     encoder.eval()
     return encoder
 
@@ -243,11 +369,27 @@ def main() -> int:
         model_configs=parse_model_configs(args),
         tokenizer_config=tokenizer_config,
     )
-    attrs = load_attrs(args.attrs)
+    combined_checkpoint_state = None
+    combined_checkpoint_path = args.checkpoint
+    if combined_checkpoint_path:
+        combined_checkpoint_state = load_checkpoint_state(combined_checkpoint_path)
+    lora_checkpoint_path = resolve_lora_checkpoint_path(args)
+    if lora_checkpoint_path:
+        lora_state = combined_checkpoint_state if lora_checkpoint_path == combined_checkpoint_path else load_checkpoint_state(lora_checkpoint_path)
+        maybe_load_lora(args, pipe, lora_state)
+    attrs = resolve_attrs(args)
     prompt = args.prompt or light_attrs_to_prompt(attrs, task=args.task, include_values=False)
     image = Image.open(args.source).convert("RGB")
     mask = Image.open(args.mask).convert("RGB") if args.mask else None
-    light_encoder = None if args.no_tokenlight_light_tokens else load_light_encoder(args, pipe)
+    light_checkpoint_path = resolve_light_checkpoint_path(args)
+    light_state = None
+    if light_checkpoint_path:
+        light_state = (
+            combined_checkpoint_state
+            if light_checkpoint_path == combined_checkpoint_path
+            else load_checkpoint_state(light_checkpoint_path)
+        )
+    light_encoder = None if args.no_tokenlight_light_tokens else load_light_encoder(args, pipe, light_state)
     video = tokenlight_wan_generate(pipe, light_encoder, attrs, prompt, image, mask, args)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

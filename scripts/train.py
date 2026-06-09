@@ -14,10 +14,16 @@ if str(SRC_ROOT) not in sys.path:
 
 import accelerate
 import torch
+from tqdm import tqdm
 
 from diffsynth.core import UnifiedDataset
 from diffsynth.core.data.operators import ImageCropAndResize, LoadAudio, LoadVideo, ToAbsolutePath
 from diffsynth.diffusion import *  # noqa: F403 - DiffSynth exposes trainer utilities here.
+from diffsynth.diffusion.runner import (
+    OffloadTrainingManager,
+    get_optimizer_class,
+    initialize_deepspeed_gradient_checkpointing,
+)
 from diffsynth.pipelines.wan_video import ModelConfig, WanVideoPipeline
 
 from tokenlight.wan import TokenLightAttributeTokenEncoder, attrs_from_batch, tokenlight_model_fn_wan_video
@@ -272,6 +278,114 @@ class TokenLightWanTrainingModule(DiffusionTrainingModule):  # noqa: F405
             inputs_shared["tokenlight_mask_image"] = _as_frames(data["mask"])[0]
         return self.parse_extra_inputs(data, self.extra_inputs, inputs_shared), inputs_posi, inputs_nega
 
+    @staticmethod
+    def _is_collated_batch(data):
+        if not isinstance(data, dict):
+            return False
+        prompt = data.get("prompt")
+        if isinstance(prompt, list):
+            return True
+        video = data.get("video")
+        return isinstance(video, list) and bool(video) and isinstance(video[0], list)
+
+    @staticmethod
+    def _batch_size_from_data(data):
+        for key in ("prompt", "attrs_json", "attrs", "task"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return len(value)
+        video = data.get("video")
+        if isinstance(video, list) and video and isinstance(video[0], list):
+            return len(video)
+        return 1
+
+    def _encode_prompts(self, prompts):
+        self.pipe.load_models_to_device(["text_encoder"])
+        ids, mask = self.pipe.tokenizer(prompts, return_mask=True, add_special_tokens=True)
+        ids = ids.to(self.pipe.device)
+        mask = mask.to(self.pipe.device)
+        seq_lens = mask.gt(0).sum(dim=1).long()
+        prompt_emb = self.pipe.text_encoder(ids, mask)
+        for index, seq_len in enumerate(seq_lens):
+            prompt_emb[index, seq_len:] = 0
+        return prompt_emb
+
+    def _preprocess_videos_batched(self, videos):
+        tensors = []
+        for video in videos:
+            frames = _as_frames(video)
+            tensors.append(self.pipe.preprocess_video(frames, device=self.pipe.device))
+        return torch.cat(tensors, dim=0).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+
+    def _encode_video_latents_batched(self, videos, inputs_shared):
+        tiled = bool(inputs_shared.get("tiled", False))
+        tile_size = inputs_shared.get("tile_size", (30, 52))
+        tile_stride = inputs_shared.get("tile_stride", (15, 26))
+        self.pipe.load_models_to_device(["vae"])
+        pixel_values = self._preprocess_videos_batched(videos)
+        latents = self.pipe.vae.encode(
+            pixel_values,
+            device=self.pipe.device,
+            tiled=tiled,
+            tile_size=tile_size,
+            tile_stride=tile_stride,
+        )
+        return latents.to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+
+    def _batched_inputs(self, data):
+        batch = self._batch_size_from_data(data)
+        videos = data["video"]
+        if not isinstance(videos, list) or len(videos) != batch:
+            raise ValueError(f"Expected {batch} batched videos, got {type(videos).__name__}")
+        first_frame = _as_frames(videos[0])[0]
+        prompts = data.get("prompt")
+        if not isinstance(prompts, list) or len(prompts) != batch:
+            raise ValueError(f"Expected {batch} prompts for batched training")
+        inputs_posi = {"prompt": prompts, "context": self._encode_prompts(prompts)}
+        inputs_nega = {}
+        inputs_shared = {
+            "input_video": videos,
+            "input_latents": None,
+            "height": first_frame.size[1],
+            "width": first_frame.size[0],
+            "num_frames": len(_as_frames(videos[0])),
+            "cfg_scale": 1,
+            "tiled": False,
+            "rand_device": self.pipe.device,
+            "use_gradient_checkpointing": self.use_gradient_checkpointing,
+            "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
+            "cfg_merge": False,
+            "vace_scale": 1,
+            "max_timestep_boundary": self.max_timestep_boundary,
+            "min_timestep_boundary": self.min_timestep_boundary,
+        }
+        inputs_shared["input_latents"] = self._encode_video_latents_batched(videos, inputs_shared)
+
+        if self.tokenlight_source_tokens:
+            source_videos = data.get("input_image", videos)
+            if isinstance(source_videos, list) and len(source_videos) == batch:
+                source_videos = [_as_frames(item) for item in source_videos]
+            else:
+                source_videos = [[_as_frames(video)[0]] for video in videos]
+            inputs_shared["tokenlight_source_latents"] = self._encode_video_latents_batched(source_videos, inputs_shared)
+
+        if self.tokenlight_mask_tokens:
+            masks = data.get("mask")
+            if isinstance(masks, list) and len(masks) == batch:
+                mask_videos = [_as_frames(item) for item in masks]
+                inputs_shared["tokenlight_mask_latents"] = self._encode_video_latents_batched(mask_videos, inputs_shared)
+            else:
+                inputs_shared["tokenlight_mask_latents"] = torch.zeros_like(inputs_shared["input_latents"])
+
+        inputs_shared["tokenlight_attrs"] = attrs_from_batch(data, key=self.tokenlight_attrs_key)
+        if self.light_encoder is not None:
+            drop_light = False
+            if self.training and self.tokenlight_cfg_drop_prob > 0:
+                drop_light = torch.rand(batch, device=inputs_posi["context"].device) < self.tokenlight_cfg_drop_prob
+            inputs_posi["tokenlight_drop_light"] = drop_light
+            inputs_nega["tokenlight_drop_light"] = True
+        return inputs_shared, inputs_posi, inputs_nega
+
     def _tokenlight_model_fn(self, **kwargs):
         return tokenlight_model_fn_wan_video(
             tokenlight_light_encoder=self.light_encoder,
@@ -311,11 +425,14 @@ class TokenLightWanTrainingModule(DiffusionTrainingModule):  # noqa: F405
                     inputs_shared["tokenlight_source_image"],
                     inputs_shared,
                 )
-        if self.tokenlight_mask_tokens and "tokenlight_mask_image" in inputs_shared:
-            inputs_shared["tokenlight_mask_latents"] = self._encode_image_latents(
-                inputs_shared["tokenlight_mask_image"],
-                inputs_shared,
-            )
+        if self.tokenlight_mask_tokens:
+            if "tokenlight_mask_image" in inputs_shared:
+                inputs_shared["tokenlight_mask_latents"] = self._encode_image_latents(
+                    inputs_shared["tokenlight_mask_image"],
+                    inputs_shared,
+                )
+            elif "input_latents" in inputs_shared:
+                inputs_shared["tokenlight_mask_latents"] = torch.zeros_like(inputs_shared["input_latents"])
         if self.light_encoder is not None:
             drop_light = False
             if self.training and self.tokenlight_cfg_drop_prob > 0 and "context" in inputs_posi:
@@ -328,6 +445,9 @@ class TokenLightWanTrainingModule(DiffusionTrainingModule):  # noqa: F405
         return inputs_shared, inputs_posi, inputs_nega
 
     def forward(self, data, inputs=None):
+        if inputs is None and self._is_collated_batch(data):
+            inputs = self._batched_inputs(data)
+            return self.task_to_loss[self.task](self.pipe, *inputs)
         if inputs is None:
             inputs = self.get_pipeline_inputs(data)
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
@@ -352,6 +472,7 @@ def wan_parser() -> argparse.ArgumentParser:
     parser.set_defaults(use_gradient_checkpointing=False, use_gradient_checkpointing_offload=False)
     parser.add_argument("--tokenizer_path", type=str, default=None)
     parser.add_argument("--audio_processor_path", type=str, default=None)
+    parser.add_argument("--batch_size", type=int, default=1, help="Per-GPU DataLoader batch size.")
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0)
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0)
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true")
@@ -393,6 +514,88 @@ def build_dataset(args):
             "wantodance_music_path": ToAbsolutePath(args.dataset_base_path),
         },
     )
+
+
+def _collate_tokenlight_batch(batch):
+    if len(batch) == 1:
+        return batch[0]
+    keys = batch[0].keys()
+    return {key: [item[key] for item in batch] for key in keys}
+
+
+def launch_tokenlight_training_task(
+    accelerator,
+    dataset,
+    model,
+    model_logger,
+    args=None,
+    **kwargs,
+):
+    del kwargs
+    learning_rate = args.learning_rate
+    weight_decay = args.weight_decay
+    num_workers = args.dataset_num_workers
+    save_steps = args.save_steps
+    num_epochs = args.num_epochs
+    enable_model_cpu_offload = args.enable_model_cpu_offload
+    enable_optimizer_cpu_offload = args.enable_optimizer_cpu_offload
+    cpu_offload_split_threshold = args.cpu_offload_split_threshold
+    customized_optimizer = args.customized_optimizer
+    batch_size = int(args.batch_size)
+    if batch_size <= 0:
+        raise ValueError("--batch_size must be positive")
+    if batch_size > 1:
+        warnings.warn(
+            "TokenLight Wan batch_size > 1 uses true batched target/source VAE latents. "
+            "Increase gradually because attention activations scale with batch size.",
+            stacklevel=2,
+        )
+
+    optimizer_class = get_optimizer_class(customized_optimizer)  # noqa: F405
+    optimizer = optimizer_class(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=_collate_tokenlight_batch,
+        num_workers=num_workers,
+        drop_last=batch_size > 1,
+    )
+
+    if enable_model_cpu_offload:
+        optimizer, dataloader, scheduler = accelerator.prepare(optimizer, dataloader, scheduler)
+        model.pipe.device = accelerator.device
+        offload_manager = OffloadTrainingManager(  # noqa: F405
+            model,
+            accelerator.device,
+            enable_optimizer_cpu_offload,
+            cpu_offload_split_threshold,
+        )
+    else:
+        model.to(device=accelerator.device)
+        model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+        offload_manager = None
+
+    initialize_deepspeed_gradient_checkpointing(accelerator)  # noqa: F405
+    for epoch_id in range(num_epochs):
+        for data in tqdm(dataloader):
+            with accelerator.accumulate(model):
+                if dataset.load_from_cache:
+                    loss = model({}, inputs=data)
+                else:
+                    loss = model(data)
+                accelerator.backward(loss)
+                if enable_model_cpu_offload:
+                    offload_manager.after_backward()
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                model_logger.on_step_end(accelerator, model, save_steps, loss=loss)
+        if save_steps is None:
+            model_logger.on_epoch_end(accelerator, model, epoch_id)
+
+    model_logger.on_training_end(accelerator, model, save_steps)
 
 
 def main() -> None:
@@ -450,10 +653,10 @@ def main() -> None:
     launcher_map = {
         "sft:data_process": launch_data_process_task,  # noqa: F405
         "direct_distill:data_process": launch_data_process_task,  # noqa: F405
-        "sft": launch_training_task,  # noqa: F405
-        "sft:train": launch_training_task,  # noqa: F405
-        "direct_distill": launch_training_task,  # noqa: F405
-        "direct_distill:train": launch_training_task,  # noqa: F405
+        "sft": launch_tokenlight_training_task,
+        "sft:train": launch_tokenlight_training_task,
+        "direct_distill": launch_tokenlight_training_task,
+        "direct_distill:train": launch_tokenlight_training_task,
     }
     launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
 

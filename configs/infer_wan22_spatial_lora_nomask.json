@@ -1,0 +1,27 @@
+{
+  "description": "TokenLight Wan2.2-TI2V-5B inference with LoRA + light encoder checkpoint.",
+  "working_dir": "/workspace",
+  "python_bin": "python",
+  "env": {
+    "DIFFSYNTH_MODEL_BASE_PATH": "/workspace/models",
+    "DIFFSYNTH_SKIP_DOWNLOAD": "True",
+    "TOKENIZERS_PARALLELISM": "false"
+  },
+  "infer_script": "scripts/infer.py",
+  "infer_args": {
+    "source": "/workspace/data/tokenlight_wan22_spatial/source_000500.png",
+    "light_id": 58,
+    "output": "/workspace/runs/tokenlight_wan22_spatial_lora_nomask/step160.png",
+    "task": "spatial",
+    "height": 704,
+    "width": 1280,
+    "num_frames": 1,
+    "num_inference_steps": 50,
+    "cfg_scale": 1.0,
+    "device": "cuda:4",
+    "model_paths": "[[\"/workspace/models/Wan2.2-TI2V-5B/diffusion_pytorch_model-00001-of-00003.safetensors\",\"/workspace/models/Wan2.2-TI2V-5B/diffusion_pytorch_model-00002-of-00003.safetensors\",\"/workspace/models/Wan2.2-TI2V-5B/diffusion_pytorch_model-00003-of-00003.safetensors\"],\"/workspace/models/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth\",\"/workspace/models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth\"]",
+    "tokenizer_path": "/workspace/models/Wan2.2-TI2V-5B/google/umt5-xxl",
+    "checkpoint": "/workspace/runs/tokenlight_wan22_spatial_lora_nomask/step-160.safetensors",
+    "no_tokenlight_mask_tokens": true
+  }
+}

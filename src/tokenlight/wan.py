@@ -221,18 +221,16 @@ class TokenLightAttributeTokenEncoder(nn.Module):
             drop_mask = drop_mask | (torch.rand(batch, device=device) < self.dropout)
         valid = valid & ~drop_mask[:, None]
 
-        tokens = torch.full(
-            (batch, len(self.token_names), self.token_dim),
-            self.null_value,
-            device=device,
-            dtype=dtype,
-        )
-        if valid.any():
-            rows, cols = torch.where(valid)
-            encoded = self.fourier(values[rows, cols].to(dtype=dtype), cols)
-            encoded = self.value_mlp(encoded)
-            tokens[rows, cols] = encoded
-        return tokens
+        # ZeRO-3 requires every rank to traverse the same trainable modules in
+        # the same order. Encode all attribute slots, then mask invalid/dropped
+        # tokens, so rank-local CFG dropout cannot skip this MLP on one rank.
+        safe_values = torch.nan_to_num(values, nan=0.0).to(dtype=dtype)
+        attribute_indices = torch.arange(len(self.token_names), device=device)
+        attribute_indices = attribute_indices.expand(batch, -1).reshape(-1)
+        encoded = self.fourier(safe_values.reshape(-1), attribute_indices)
+        encoded = self.value_mlp(encoded).reshape(batch, len(self.token_names), self.token_dim)
+        null_tokens = torch.full_like(encoded, self.null_value)
+        return torch.where(valid[..., None], encoded, null_tokens)
 
     def _attrs_list(
         self,
@@ -317,6 +315,21 @@ def _freqs_for_grid(dit: nn.Module, grid: tuple[int, int, int], device: torch.de
         dim=-1,
     )
     return freqs.reshape(f * h * w, 1, -1).to(device)
+
+
+def _assert_same_sequence_layout(prefix_len: int, sequence_len: int, device: torch.device) -> None:
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return
+    local = torch.tensor([prefix_len, sequence_len], device=device, dtype=torch.long)
+    gathered = [torch.zeros_like(local) for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather(gathered, local)
+    layouts = torch.stack(gathered, dim=0)
+    if not torch.all(layouts == layouts[0]).item():
+        rank = torch.distributed.get_rank()
+        raise RuntimeError(
+            f"Rank {rank} saw TokenLight sequence layout {local.tolist()}, "
+            f"but all ranks saw {layouts.cpu().tolist()}"
+        )
 
 
 def _clean_prefix_t_mod(dit: nn.Module, prefix_len: int, batch: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -461,13 +474,20 @@ def tokenlight_model_fn_wan_video(
         prefix_freqs.append(_freqs_for_grid(dit, mask_grid, target_tokens.device))
 
     if tokenlight_light_encoder is not None:
-        light_tokens = tokenlight_light_encoder(
+        light_tokens_real = tokenlight_light_encoder(
             tokenlight_attrs,
             batch_size=batch,
             device=target_tokens.device,
             dtype=target_tokens.dtype,
-            drop_light=tokenlight_drop_light,
+            drop_light=False,
         )
+        drop_mask = tokenlight_light_encoder._drop_mask(
+            tokenlight_drop_light,
+            batch=batch,
+            device=target_tokens.device,
+        )
+        null_light = torch.full_like(light_tokens_real, tokenlight_light_encoder.null_value)
+        light_tokens = torch.where(drop_mask[:, None, None], null_light, light_tokens_real)
         prefix_tokens.append(light_tokens)
         light_freqs = torch.ones(
             light_tokens.shape[1],
@@ -489,6 +509,8 @@ def tokenlight_model_fn_wan_video(
         prefix_len = 0
         x = target_tokens
         freqs = target_freqs
+
+    _assert_same_sequence_layout(prefix_len, x.shape[1], x.device)
 
     for block in dit.blocks:
         x = gradient_checkpoint_forward_compatible(

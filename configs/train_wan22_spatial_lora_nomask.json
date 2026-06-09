@@ -1,0 +1,44 @@
+{
+  "description": "TokenLight Wan2.2-TI2V-5B LoRA training on tokenlight_wan22_spatial without mask tokens.",
+  "working_dir": "/workspace",
+  "cuda_visible_devices": "0,1,2,3",
+  "env": {
+    "DIFFSYNTH_MODEL_BASE_PATH": "/workspace/models",
+    "DIFFSYNTH_SKIP_DOWNLOAD": "True",
+    "TOKENIZERS_PARALLELISM": "false"
+  },
+  "accelerate_bin": "accelerate",
+  "accelerate": {
+    "config_file": "configs/accelerate_wan22_6x40gb_zero3.yaml"
+  },
+  "train_script": "scripts/train.py",
+  "train_args": {
+    "dataset_base_path": "/workspace/data/tokenlight_wan22_spatial",
+    "dataset_metadata_path": "/workspace/data/tokenlight_wan22_spatial/metadata.csv",
+    "data_file_keys": "video,input_image",
+    "height": 704,
+    "width": 1280,
+    "num_frames": 1,
+    "dataset_repeat": 1,
+    "dataset_num_workers": 0,
+    "model_paths": "[[\"/workspace/models/Wan2.2-TI2V-5B/diffusion_pytorch_model-00001-of-00003.safetensors\",\"/workspace/models/Wan2.2-TI2V-5B/diffusion_pytorch_model-00002-of-00003.safetensors\",\"/workspace/models/Wan2.2-TI2V-5B/diffusion_pytorch_model-00003-of-00003.safetensors\"],\"/workspace/models/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth\",\"/workspace/models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth\"]",
+    "tokenizer_path": "/workspace/models/Wan2.2-TI2V-5B/google/umt5-xxl",
+    "task": "sft",
+    "learning_rate": 0.0001,
+    "num_epochs": 20,
+    "save_steps": 1000,
+    "remove_prefix_in_ckpt": "pipe.dit.",
+    "output_path": "/workspace/runs/tokenlight_wan22_spatial_lora_nomask",
+    "lora_base_model": "dit",
+    "lora_target_modules": "q,k,v",
+    "lora_rank": 32,
+    "tokenlight_light_tokens": true,
+    "tokenlight_source_tokens": true,
+    "tokenlight_mask_tokens": false,
+    "tokenlight_cfg_drop_prob": 0.1,
+    "use_gradient_checkpointing": false,
+    "use_gradient_checkpointing_offload": false,
+    "initialize_model_on_cpu": true,
+    "enable_tensorboard_log": true
+  }
+}

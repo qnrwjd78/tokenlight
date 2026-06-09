@@ -1,149 +1,146 @@
-# TokenLight Reproduction
+# TokenLight Wan2.2 Reproduction
 
-This repository targets the TokenLight paper. UniRelight is not the method being
-reproduced. The only UniRelight/Cosmos role is to provide a public substitute for
-TokenLight's unpublished pretrained text-to-video base checkpoint.
+This repo now targets TokenLight reproduction on top of the public
+Wan2.2-TI2V-5B base model through DiffSynth-Studio.
 
-Implemented TokenLight paper logic:
+The active method is:
 
-- image, mask, and target latents are tokenized into one full self-attention sequence
-- scalar lighting attributes use Gaussian Fourier features with `sigma = 5`
-- vector lighting attributes are represented as component tokens
-- fixture masks are encoded through the same VAE path as images
-- training uses the linear-interpolant flow-matching target `X - eps`
-- inference keeps source image and mask conditioning and drops only light tokens for CFG
-- renderer utilities preserve the paper's linear RGB component-composition equations
-- camera-light canonicalization follows the paper's Sim(3) scaling rules
+```text
+source image I
+target relit image/video Ir
+TokenLight numeric light attrs DeltaL
 
-The paper does not publicly identify the exact pretrained text-to-video checkpoint,
-VAE weights, DiT block config, token MLP dimensions, sampler update, asset list, or
-evaluation split. In this repo, the base-model gap is filled by the Cosmos/UniRelight
-checkpoint family, while the TokenLight task/model/data logic stays separate.
+Wan TI2V:
+  source     = I  (loaded from input_image column)
+  video       = Ir
+  prompt      = generic task text
+  DiT tokens  = [source latent] + [mask latent] + [light attrs] + [noisy target latent]
+```
 
-See [docs/tokenlight_cosmos_base.md](docs/tokenlight_cosmos_base.md) for the
-decision boundary.
+The old non-Wan training path has been removed.
 
 ## Layout
 
 ```text
-configs/tokenlight_cosmos.toml    TokenLight config with Cosmos/UniRelight base
-configs/relighting_dataset_960.json  Blender component-render config for /workspace/data
-docs/tokenlight_cosmos_base.md    TokenLight-first base-model decision
-docs/docker_workspace.md          Docker workspace and mount layout
-docker/Dockerfile                 Minimal CUDA/PyTorch runtime image
-src/tokenlight/model.py           DiT sequence model
-src/tokenlight/tokenizer.py       Lighting attribute tokenizer
-src/tokenlight/flow.py            Flow-matching training loss
-src/tokenlight/sampler.py         Deterministic flow/DDIM-style sampler
-src/tokenlight/data.py            Manifest and component-render datasets
-src/tokenlight/color.py           Linear RGB composition and Reinhard tone mapping
-src/tokenlight/canonical.py       Sim(3) camera-light canonical transform
-scripts/train.py                  Training entrypoint
-scripts/infer.py                  Inference entrypoint
-scripts/evaluate.py               PSNR/SSIM/optional LPIPS evaluation
-scripts/inspect_base.py           Cosmos base-file readiness check
-scripts/blender_render_components.py  Blender component-render helper
+configs/relighting_dataset_wan22_1280x704.json  1280x704 component render config
+configs/accelerate_wan22_6x40gb_zero3.yaml      6 GPU Accelerate/DeepSpeed ZeRO-3 config
+configs/tokenlight_wan22_ti2v_5b.toml           baseline settings record
+docs/tokenlight_wan22_base.md                   full command reference
+docker/Dockerfile                               Wan/DiffSynth runtime image
+scripts/export_wan22_tokenlight_dataset.py      component pairs -> Wan metadata
+scripts/train.py                                Wan2.2 TokenLight trainer
+scripts/infer.py                                Wan2.2 TokenLight inference
+scripts/evaluate.py                             image metric helper
+src/tokenlight/data.py                          relighting_dataset adapter
+src/tokenlight/wan.py                           paper-style Wan token injection
 ```
 
-## Paper-scale Config
+## Render Components
 
-`configs/tokenlight_cosmos.toml` uses the public TokenLight settings plus the
-Cosmos base substitution:
+```bash
+cd /workspace/repos/relighting_dataset
+python scripts/run_blender_batch.py \
+  --config /workspace/configs/relighting_dataset_wan22_1280x704.json \
+  --max-scenes 10 \
+  --width 1280 \
+  --height 704 \
+  --samples 128
+```
 
-- input resolution: `960`
-- Cosmos latent: `16 x 120 x 120`
-- patch size: `2`
-- token grid: `60 x 60`
-- hidden dim: `4096`
-- depth: `28`, heads: `32`, matching Cosmos FADITV2 config
-- transformer source: `cosmos_faditv2_tokenlight`
-- bfloat16, AdamW, LR `1e-5`, WD `0.01`, betas `(0.9, 0.95)`
-- global batch `160`, steps `15000`
-- sampler steps `50`, light-token CFG scale `2`
+## Export Wan Dataset From Point-Light PNGs
 
-This intentionally does not use UniRelight's `env_ldr/env_log/env_nrm` relighting
-conditioner as the TokenLight condition interface. TokenLight light attributes
-remain numeric tokens.
+```bash
+cd /workspace
+python scripts/export_wan22_tokenlight_dataset.py \
+  --dataset-kind point-light-png \
+  --data-root /workspace/data/sample \
+  --output /workspace/data/tokenlight_wan22_train \
+  --modes spatial ambient diffuse \
+  --pairing all-targets \
+  --count 0 \
+  --width 1280 \
+  --height 704 \
+  --num-frames 1 \
+  --target-format png \
+  --include-object-masks \
+  --prompt-mode generic \
+  --overwrite
+```
 
-The Cosmos-backed model keeps TokenLight's sequence:
+`spatial` reads the 64 point-light PNGs directly. `ambient` and `diffuse`
+synthesize PNG pairs from EXR components during export, then write normal Wan
+metadata rows. `--pairing all-targets --count 0` exports every deterministic
+target row once. If you only want the 64-light task, pass `--modes spatial`.
+If you really want all 64 spatial IDs even when the renderer marked some as
+copied/invalid, add `--include-invalid-lights`.
+
+The CSV contains:
 
 ```text
-[source image tokens] + [mask tokens] + [light tokens] + [noisy target tokens]
+video,input_image,mask,prompt,task,attrs_json
 ```
 
-but replaces the native toy transformer with Cosmos/FADITV2-style modules:
+`attrs_json` is encoded as DiT self-attention light tokens. The prompt stays
+generic unless `--prompt-mode attrs` is selected.
 
-```text
-x_embedder
-t_embedder
-blocks.block*
-final_layer
+## Train LoRA
+
+```bash
+cd /workspace
+export DIFFSYNTH_MODEL_BASE_PATH=/workspace/models
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 accelerate launch \
+  --config_file configs/accelerate_wan22_6x40gb_zero3.yaml \
+  scripts/train.py \
+  --dataset_base_path /workspace/data/tokenlight_wan22_train \
+  --dataset_metadata_path /workspace/data/tokenlight_wan22_train/metadata.csv \
+  --data_file_keys video,input_image,mask \
+  --height 704 \
+  --width 1280 \
+  --num_frames 1 \
+  --dataset_repeat 100 \
+  --model_id_with_origin_paths "Wan-AI/Wan2.2-TI2V-5B:diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.2-TI2V-5B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.2-TI2V-5B:Wan2.2_VAE.pth" \
+  --learning_rate 1e-4 \
+  --num_epochs 2 \
+  --remove_prefix_in_ckpt "pipe.dit." \
+  --output_path /workspace/runs/tokenlight_wan22_lora \
+  --lora_base_model dit \
+  --lora_target_modules "q,k,v" \
+  --lora_rank 32 \
+  --tokenlight_light_tokens \
+  --tokenlight_source_tokens \
+  --tokenlight_mask_tokens \
+  --use_gradient_checkpointing \
+  --use_gradient_checkpointing_offload \
+  --initialize_model_on_cpu
 ```
 
-This naming is intentional so compatible tensors from Cosmos checkpoints can be
-loaded into the TokenLight model.
+## Train Full DiT
 
-## Manifest Format
+```bash
+cd /workspace
+export DIFFSYNTH_MODEL_BASE_PATH=/workspace/models
 
-Training manifests are JSONL files. Paths are relative to `--data-root`.
-
-```json
-{"source":"source/0001.png","target":"target/0001.png","mask":"mask/0001.png","attrs":{"a":0.8,"x":0.1,"y":0.4,"z":0.7,"r":1.0,"g":0.9,"b":0.7,"lambda":0.6,"d":0.3}}
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 accelerate launch \
+  --config_file configs/accelerate_wan22_6x40gb_zero3.yaml \
+  scripts/train.py \
+  --dataset_base_path /workspace/data/tokenlight_wan22_train \
+  --dataset_metadata_path /workspace/data/tokenlight_wan22_train/metadata.csv \
+  --data_file_keys video,input_image,mask \
+  --height 704 \
+  --width 1280 \
+  --num_frames 1 \
+  --dataset_repeat 100 \
+  --model_id_with_origin_paths "Wan-AI/Wan2.2-TI2V-5B:diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.2-TI2V-5B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.2-TI2V-5B:Wan2.2_VAE.pth" \
+  --learning_rate 1e-5 \
+  --num_epochs 2 \
+  --remove_prefix_in_ckpt "pipe.dit." \
+  --output_path /workspace/runs/tokenlight_wan22_full \
+  --trainable_models dit \
+  --tokenlight_light_tokens \
+  --tokenlight_source_tokens \
+  --tokenlight_mask_tokens \
+  --use_gradient_checkpointing \
+  --use_gradient_checkpointing_offload \
+  --initialize_model_on_cpu
 ```
-
-Missing attributes are represented as null light tokens. This is used for real
-capture pairs where color, precise light position, or diffuse controls are unknown.
-
-Component-render manifests can be loaded through `ComponentRelightDataset` for
-spatial/fixture supervision and `DiffuseSpreadDataset` for spread-control pairs.
-When using `repos/relighting_dataset`, train directly from its component output
-with `--dataset-type relighting-components`; this converts the generated
-`input/target/condition` samples into `source/target/attrs` batches without
-modifying the external repo.
-
-## Base Check
-
-Before training, check whether the Cosmos/UniRelight base assets referenced by
-the config are present:
-
-```powershell
-python scripts/inspect_base.py --config configs/tokenlight_cosmos.toml
-```
-
-If files are missing, download the UniRelight/Cosmos checkpoints first. These
-files are used as base VAE/backbone assets only; they do not change the
-TokenLight condition interface.
-
-## Train
-
-```powershell
-pip install -e .
-python scripts/train.py --config configs/tokenlight_cosmos.toml --manifest data/train.jsonl --data-root data --output runs/tokenlight
-```
-
-With synthetic components generated by `repos/relighting_dataset`:
-
-```powershell
-python scripts/train.py --config configs/tokenlight_cosmos.toml --dataset-type relighting-components --component-repo repos/relighting_dataset --component-root data/tokenlight_synthetic --component-modes spatial ambient diffuse --output runs/tokenlight
-```
-
-For a real paper-scale run, download the Cosmos/UniRelight tokenizer/checkpoint
-files referenced by the config and launch with distributed FSDP on the target
-hardware.
-
-## Inference
-
-```powershell
-python scripts/infer.py --config configs/tokenlight_cosmos.toml --checkpoint runs/tokenlight/latest.pt --source input.png --attrs attrs.json --output relit.png
-```
-
-The sampler implements the paper-compatible deterministic flow update:
-
-```text
-v_cond   = model(z, tau, I, DeltaL)
-v_uncond = model(z, tau, I, drop(DeltaL))
-v        = v_uncond + cfg_scale * (v_cond - v_uncond)
-z_next   = z + dt * v
-```
-
-If the official sampler becomes available, replace `TokenLightSampler.step`.

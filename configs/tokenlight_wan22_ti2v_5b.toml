@@ -1,0 +1,56 @@
+[base]
+provider = "wan22_ti2v_5b"
+framework = "diffsynth_studio"
+model_id = "Wan-AI/Wan2.2-TI2V-5B"
+train_script = "scripts/train.py"
+infer_script = "scripts/infer.py"
+accelerate_config = "configs/accelerate_wan22_6x40gb_zero3.yaml"
+
+[data]
+dataset_kind = "point-light-png"
+data_root = "/workspace/data/sample"
+component_root = "/workspace/data/sample"
+component_repo = "/workspace/repos/relighting_dataset"
+export_root = "/workspace/data/tokenlight_wan22_train"
+metadata = "/workspace/data/tokenlight_wan22_train/metadata.csv"
+width = 1280
+height = 704
+num_frames = 1
+data_file_keys = "video,input_image,mask"
+extra_inputs = ""
+modes = ["spatial", "ambient", "diffuse"]
+pairing = "all-targets"
+include_invalid_lights = false
+source_light_id = 0
+
+[tokenlight_tokens]
+enabled = true
+attrs_key = "attrs_json"
+source_tokens = true
+mask_tokens = true
+token_dim = 0
+fourier_features = 512
+fourier_sigma = 5.0
+mlp_hidden_dim = 4096
+light_dropout = 0.0
+cfg_drop_prob = 0.1
+
+[training]
+precision = "bf16"
+distributed = "accelerate_deepspeed_zero3"
+num_processes = 6
+trainable_models = "dit"
+learning_rate = 1e-5
+dataset_repeat = 100
+num_epochs = 2
+use_gradient_checkpointing = true
+use_gradient_checkpointing_offload = true
+initialize_model_on_cpu = true
+remove_prefix_in_ckpt = "pipe.dit."
+
+[lora]
+enabled = true
+lora_base_model = "dit"
+lora_target_modules = "q,k,v"
+lora_rank = 32
+learning_rate = 1e-4

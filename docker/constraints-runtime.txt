@@ -1,0 +1,5 @@
+# Keep PyTorch aligned with the explicit CUDA 12.4 wheel install in Dockerfile.
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+triton==3.2.0

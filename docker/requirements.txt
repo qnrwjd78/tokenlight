@@ -1,0 +1,31 @@
+diffsynth==2.0.12
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+torchcodec==0.2.1
+triton==3.2.0
+# transformers 4.57.x imports fine-grained FP8 dtypes that torch 2.6.0
+# does not expose, which breaks PEFT/DiffSynth import before training starts.
+transformers==4.56.2
+huggingface_hub>=0.34.0,<1.0
+fsspec[http]>=2023.1.0,<=2026.4.0
+imageio
+imageio[ffmpeg]
+OpenEXR
+av
+safetensors
+einops
+sentencepiece
+protobuf
+modelscope
+ftfy
+pandas
+accelerate==1.13.0
+deepspeed
+peft==0.17.1
+datasets==5.0.0
+librosa
+soundfile
+tqdm
+pillow
+tensorboard>=2.16,<3

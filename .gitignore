@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Caches / logs
+.cache/
+.hf_cache/
+.tmp/
+logs/
+wandb/
+runs/
+tensorboard_log/
+
+# Large datasets / downloads
+data/
+data_train/
+data_raw/
+downloads/
+downloaded_inputs/
+downloaded_previews/
+hf_downloads/
+outputs/
+
+# Model weights / checkpoints / generated inference
+weights/
+model/train/
+model/infer/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# Archives / heavy media
+*.tar
+*.tar.gz
+*.zst
+*.zip
+*.exr
+*.mp4
+*.mov

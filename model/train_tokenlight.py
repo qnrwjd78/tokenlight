@@ -165,6 +165,51 @@ def _normalize_wan_lora_target_modules(value):
     return ",".join(mapped)
 
 
+def _load_checkpoint_state_dict(checkpoint_path: str | None) -> dict[str, torch.Tensor]:
+    if checkpoint_path in (None, "", "None", "null"):
+        return {}
+    path = Path(str(checkpoint_path))
+    if not path.exists() or path.is_dir():
+        return {}
+    if path.suffix == ".safetensors":
+        from safetensors.torch import load_file
+
+        return load_file(str(path), device="cpu")
+    loaded = torch.load(path, map_location="cpu")
+    if isinstance(loaded, dict):
+        for key in ("state_dict", "module", "model"):
+            value = loaded.get(key)
+            if isinstance(value, dict):
+                return value
+        if all(isinstance(value, torch.Tensor) for value in loaded.values()):
+            return loaded
+    return {}
+
+
+def _extract_module_state(state_dict: dict[str, torch.Tensor], module_prefix: str) -> dict[str, torch.Tensor]:
+    result = {}
+    prefixes = (f"{module_prefix}.", f"module.{module_prefix}.")
+    for key, value in state_dict.items():
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                result[key[len(prefix) :]] = value
+                break
+    return result
+
+
+def _load_module_state_from_checkpoint(module: nn.Module | None, state_dict: dict[str, torch.Tensor], prefix: str) -> None:
+    if module is None:
+        return
+    module_state = _extract_module_state(state_dict, prefix)
+    if not module_state:
+        return
+    missing, unexpected = module.load_state_dict(module_state, strict=False)
+    print(
+        f"Loaded {prefix} from checkpoint: "
+        f"tensors={len(module_state)}, missing={len(missing)}, unexpected={len(unexpected)}"
+    )
+
+
 def _require_nonempty_light_attrs(attrs: list[dict], *, key: str) -> list[dict]:
     missing = [index for index, item in enumerate(attrs) if not item]
     if missing:
@@ -997,6 +1042,9 @@ class TokenLightWanTrainingModule(DiffusionTrainingModule):  # noqa: F405
             if self.tokenlight_light_tokens or self.tokenlight_source_tokens or self.tokenlight_mask_tokens
             else None
         )
+        aux_state = _load_checkpoint_state_dict(lora_checkpoint or resume_from_checkpoint)
+        _load_module_state_from_checkpoint(self.light_encoder, aux_state, "light_encoder")
+        _load_module_state_from_checkpoint(self.tokenlight_type_embedding, aux_state, "tokenlight_type_embedding")
         if self.tokenlight_light_tokens or self.tokenlight_source_tokens or self.tokenlight_mask_tokens:
             self.pipe.model_fn = self._tokenlight_model_fn
 
@@ -1294,6 +1342,7 @@ def wan_parser(train_mode: str = "single") -> argparse.ArgumentParser:
 
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--num_epochs", type=int, default=1)
+    parser.add_argument("--start_epoch", type=int, default=0)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--save_steps", type=int, default=None)
@@ -1306,6 +1355,7 @@ def wan_parser(train_mode: str = "single") -> argparse.ArgumentParser:
     parser.add_argument("--lora_checkpoint", type=str, default=None)
     parser.add_argument("--preset_lora_path", type=str, default=None)
     parser.add_argument("--preset_lora_model", type=str, default=None)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
 
     parser.add_argument(
         "--task",
@@ -1410,7 +1460,8 @@ def launch_tokenlight_training_task(
     weight_decay = args.weight_decay
     num_workers = args.dataset_num_workers
     save_steps = args.save_steps
-    num_epochs = args.num_epochs
+    num_epochs = int(args.num_epochs)
+    start_epoch = int(getattr(args, "start_epoch", 0) or 0)
     enable_model_cpu_offload = getattr(args, "enable_model_cpu_offload", False)
     enable_optimizer_cpu_offload = getattr(args, "enable_optimizer_cpu_offload", False)
     cpu_offload_split_threshold = getattr(args, "cpu_offload_split_threshold", None)
@@ -1465,7 +1516,7 @@ def launch_tokenlight_training_task(
     initialize_deepspeed_gradient_checkpointing(accelerator)  # noqa: F405
     local_step = int(getattr(model_logger, "num_steps", 0))
     try:
-        for epoch_id in range(num_epochs):
+        for epoch_id in range(start_epoch, start_epoch + num_epochs):
             for data in tqdm(dataloader):
                 with accelerator.accumulate(model):
                     if dataset.load_from_cache:

@@ -9,6 +9,7 @@ import inspect
 import json
 import math
 import os
+import random
 import shutil
 import sys
 import warnings
@@ -808,6 +809,14 @@ def _collect_train_metrics(accelerator, model, optimizer, loss):
     ):
         for key, value in _module_gradient_stats(module).items():
             metrics[f"{prefix}_{key}"] = _mean_across_processes(accelerator, value)
+    pipe = getattr(unwrapped_model, "pipe", None)
+    extra_loss_metrics = getattr(pipe, "_tokenlight_loss_metrics", None)
+    if isinstance(extra_loss_metrics, dict):
+        for key, value in extra_loss_metrics.items():
+            if isinstance(value, torch.Tensor):
+                metrics[str(key)] = _loss_to_float(accelerator, value)
+            else:
+                metrics[str(key)] = _mean_across_processes(accelerator, value)
     return {key: value for key, value in metrics.items() if value is not None}
 
 
@@ -1339,6 +1348,8 @@ def wan_parser(train_mode: str = "single") -> argparse.ArgumentParser:
     parser.add_argument("--num_frames", type=int, default=1)
     parser.add_argument("--max_pixels", type=int, default=1280 * 704)
     parser.add_argument("--batch_size", type=int, default=1, help="Per-GPU DataLoader batch size.")
+    parser.add_argument("--balanced_task_batch", default=None)
+    parser.add_argument("--balanced_batch_seed", type=int, default=0)
 
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--num_epochs", type=int, default=1)
@@ -1447,6 +1458,78 @@ def _collate_tokenlight_batch(batch):
     return {key: [item.get(key) for item in batch] for key in keys}
 
 
+def _parse_balanced_task_batch(value) -> dict[str, int] | None:
+    if value in (None, "", "none", "None", "null"):
+        return None
+    if isinstance(value, dict):
+        result = {str(key): int(item) for key, item in value.items() if int(item) > 0}
+        return result or None
+    result = {}
+    for item in str(value).split(","):
+        if not item.strip():
+            continue
+        key, count = item.split(":", 1)
+        result[key.strip()] = int(count)
+    return {key: count for key, count in result.items() if count > 0} or None
+
+
+def _configure_deepspeed_batch_size(accelerator, args, batch_size: int) -> None:
+    plugin = getattr(getattr(accelerator, "state", None), "deepspeed_plugin", None)
+    ds_config = getattr(plugin, "deepspeed_config", None)
+    if not isinstance(ds_config, dict):
+        return
+    grad_accum = int(getattr(args, "gradient_accumulation_steps", 1) or 1)
+    num_processes = int(getattr(accelerator, "num_processes", 1) or 1)
+    ds_config["train_micro_batch_size_per_gpu"] = int(batch_size)
+    ds_config["gradient_accumulation_steps"] = grad_accum
+    ds_config["train_batch_size"] = int(batch_size) * grad_accum * num_processes
+    print(
+        "DeepSpeed batch setup: "
+        f"train_micro_batch_size_per_gpu={ds_config['train_micro_batch_size_per_gpu']}, "
+        f"gradient_accumulation_steps={ds_config['gradient_accumulation_steps']}, "
+        f"train_batch_size={ds_config['train_batch_size']}"
+    )
+
+
+class BalancedTaskBatchSampler:
+    def __init__(self, rows, task_batch: dict[str, int], *, seed: int = 0) -> None:
+        self.rows = rows
+        self.task_batch = task_batch
+        self.seed = int(seed)
+        self.batch_size = int(sum(task_batch.values()))
+        self.pools: dict[str, list[int]] = {task: [] for task in task_batch}
+        for index, row in enumerate(rows):
+            task = str(row.get("task", ""))
+            if task in self.pools:
+                self.pools[task].append(index)
+        missing = [task for task, pool in self.pools.items() if not pool]
+        if missing:
+            raise ValueError(f"Cannot build balanced batches; missing task rows: {missing}")
+        self._length = max(math.ceil(len(self.pools[task]) / count) for task, count in self.task_batch.items())
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __iter__(self):
+        rng = random.Random(self.seed)
+        pools = {task: list(indices) for task, indices in self.pools.items()}
+        cursors = {task: 0 for task in self.task_batch}
+        for indices in pools.values():
+            rng.shuffle(indices)
+        for _ in range(len(self)):
+            batch = []
+            for task, count in self.task_batch.items():
+                pool = pools[task]
+                for _ in range(count):
+                    if cursors[task] >= len(pool):
+                        rng.shuffle(pool)
+                        cursors[task] = 0
+                    batch.append(pool[cursors[task]])
+                    cursors[task] += 1
+            rng.shuffle(batch)
+            yield batch
+
+
 def launch_tokenlight_training_task(
     accelerator,
     dataset,
@@ -1488,15 +1571,31 @@ def launch_tokenlight_training_task(
     optimizer_class = get_optimizer_class(customized_optimizer)  # noqa: F405
     optimizer = optimizer_class(_trainable_parameters(model), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=_collate_tokenlight_batch,
-        num_workers=num_workers,
-        drop_last=batch_size > 1,
-    )
+    task_batch = _parse_balanced_task_batch(getattr(args, "balanced_task_batch", None))
+    if task_batch is None:
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=_collate_tokenlight_batch,
+            num_workers=num_workers,
+            drop_last=batch_size > 1,
+        )
+    else:
+        if sum(task_batch.values()) != batch_size:
+            raise ValueError(f"balanced_task_batch sums to {sum(task_batch.values())}, but batch_size={batch_size}")
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_sampler=BalancedTaskBatchSampler(
+                dataset.data,
+                task_batch,
+                seed=int(getattr(args, "balanced_batch_seed", 0)),
+            ),
+            collate_fn=_collate_tokenlight_batch,
+            num_workers=num_workers,
+        )
 
+    _configure_deepspeed_batch_size(accelerator, args, batch_size)
     if enable_model_cpu_offload:
         optimizer, dataloader, scheduler = accelerator.prepare(optimizer, dataloader, scheduler)
         model.pipe.device = accelerator.device

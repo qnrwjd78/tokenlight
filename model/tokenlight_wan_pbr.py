@@ -13,8 +13,16 @@ from model.lightoken_encoder import LightokenEncoder
 TOKENLIGHT_TYPE_SOURCE = 0
 TOKENLIGHT_TYPE_LIGHT = 1
 TOKENLIGHT_TYPE_RGB_TARGET = 2
-TOKENLIGHT_TYPE_PBR_TARGET = 3
-TOKENLIGHT_TYPE_PBR_CONDITION = 4
+TOKENLIGHT_TYPE_PBR_TARGET_BASE = 3
+TOKENLIGHT_TYPE_PBR_CONDITION_BASE = 4
+TOKENLIGHT_TYPE_PBR_STRIDE = 2
+TOKENLIGHT_TYPE_PBR_TARGET = TOKENLIGHT_TYPE_PBR_TARGET_BASE
+TOKENLIGHT_TYPE_PBR_CONDITION = TOKENLIGHT_TYPE_PBR_CONDITION_BASE
+
+
+def tokenlight_pbr_type_count(stream_count: int = 1) -> int:
+    stream_count = max(1, int(stream_count))
+    return TOKENLIGHT_TYPE_PBR_CONDITION_BASE + TOKENLIGHT_TYPE_PBR_STRIDE * (stream_count - 1) + 1
 
 
 class TokenLightPBRTypeEmbedding(nn.Module):
@@ -147,6 +155,32 @@ def _bool_mask(value: bool | torch.Tensor | Sequence[bool], batch: int, device: 
     return torch.full((batch,), bool(value), device=device, dtype=torch.bool)
 
 
+def _pbr_stream_items(
+    stream_latents: Mapping[str, torch.Tensor] | Sequence[tuple[str, torch.Tensor]] | None,
+    legacy_latents: torch.Tensor | None,
+) -> tuple[list[tuple[str, torch.Tensor]], bool]:
+    if stream_latents is None:
+        return ([] if legacy_latents is None else [("pbr", legacy_latents)]), legacy_latents is not None
+    if isinstance(stream_latents, Mapping):
+        items = [(str(name), latents) for name, latents in stream_latents.items()]
+    else:
+        items = [(str(name), latents) for name, latents in stream_latents]
+    names = [name for name, _ in items]
+    if len(set(names)) != len(names):
+        raise ValueError(f"Duplicate PBR stream names: {names}")
+    return items, False
+
+
+def _pbr_stream_target_value(
+    stream_is_target: Mapping[str, bool | torch.Tensor | Sequence[bool]] | None,
+    name: str,
+    default: bool | torch.Tensor | Sequence[bool],
+) -> bool | torch.Tensor | Sequence[bool]:
+    if isinstance(stream_is_target, Mapping):
+        return stream_is_target.get(name, default)
+    return default
+
+
 def _select_t_mod_by_mask(clean: torch.Tensor, noisy: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:
     if clean.shape != noisy.shape:
         raise ValueError(f"Cannot mix clean/noisy t_mod with shapes {clean.shape} and {noisy.shape}")
@@ -172,11 +206,13 @@ def model_fn_wan_video_tokenlight_pbr(
     tokenlight_drop_light: bool | torch.Tensor | Sequence[bool] = False,
     tokenlight_source_latents: torch.Tensor | None = None,
     tokenlight_pbr_latents: torch.Tensor | None = None,
+    tokenlight_pbr_stream_latents: Mapping[str, torch.Tensor] | Sequence[tuple[str, torch.Tensor]] | None = None,
     tokenlight_pbr_is_target: bool | torch.Tensor | Sequence[bool] = True,
+    tokenlight_pbr_stream_is_target: Mapping[str, bool | torch.Tensor | Sequence[bool]] | None = None,
     use_gradient_checkpointing: bool = False,
     use_gradient_checkpointing_offload: bool = False,
     **kwargs,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | dict[str, torch.Tensor] | None]:
     del kwargs
     from einops import rearrange
     from diffsynth.models.wan_video_dit import sinusoidal_embedding_1d
@@ -216,8 +252,7 @@ def model_fn_wan_video_tokenlight_pbr(
     t_mod_pieces: list[torch.Tensor] = []
     rgb_start = 0
     rgb_len = target_tokens.shape[1]
-    pbr_start: int | None = None
-    pbr_len = 0
+    pbr_segments: dict[str, tuple[int, int, tuple[int, int, int]]] = {}
     if tokenlight_source_latents is not None:
         source_tokens, source_grid = _patch_to_tokens(dit, tokenlight_source_latents, batch)
         source_tokens = _add_type_embedding(source_tokens, tokenlight_type_embedding, TOKENLIGHT_TYPE_SOURCE)
@@ -232,19 +267,27 @@ def model_fn_wan_video_tokenlight_pbr(
     if t_mod.ndim == 4:
         t_mod_pieces.append(t_mod)
 
-    pbr_target_mask = _bool_mask(tokenlight_pbr_is_target, batch, target_tokens.device)
-    if tokenlight_pbr_latents is not None:
-        pbr_tokens, pbr_grid = _patch_to_tokens(dit, tokenlight_pbr_latents, batch)
+    pbr_streams, legacy_pbr_stream = _pbr_stream_items(tokenlight_pbr_stream_latents, tokenlight_pbr_latents)
+    for stream_index, (stream_name, stream_latents) in enumerate(pbr_streams):
+        pbr_target_mask = _bool_mask(
+            _pbr_stream_target_value(tokenlight_pbr_stream_is_target, stream_name, tokenlight_pbr_is_target),
+            batch,
+            target_tokens.device,
+        )
+        pbr_tokens, pbr_grid = _patch_to_tokens(dit, stream_latents, batch)
         if pbr_grid != target_grid:
-            raise ValueError(f"PBR latent grid {pbr_grid} must match RGB target grid {target_grid}")
+            raise ValueError(f"PBR stream `{stream_name}` latent grid {pbr_grid} must match RGB target grid {target_grid}")
+        target_type = TOKENLIGHT_TYPE_PBR_TARGET_BASE + stream_index * TOKENLIGHT_TYPE_PBR_STRIDE
+        condition_type = TOKENLIGHT_TYPE_PBR_CONDITION_BASE + stream_index * TOKENLIGHT_TYPE_PBR_STRIDE
         pbr_type = torch.where(
             pbr_target_mask,
-            torch.full_like(pbr_target_mask, TOKENLIGHT_TYPE_PBR_TARGET, dtype=torch.long),
-            torch.full_like(pbr_target_mask, TOKENLIGHT_TYPE_PBR_CONDITION, dtype=torch.long),
+            torch.full_like(pbr_target_mask, target_type, dtype=torch.long),
+            torch.full_like(pbr_target_mask, condition_type, dtype=torch.long),
         )
         pbr_tokens = _add_type_embedding(pbr_tokens, tokenlight_type_embedding, pbr_type)
         pbr_start = sum(tokens.shape[1] for tokens in all_tokens)
         pbr_len = pbr_tokens.shape[1]
+        pbr_segments[stream_name] = (pbr_start, pbr_len, pbr_grid)
         all_tokens.append(pbr_tokens)
         all_freqs.append(_freqs_for_grid(dit, pbr_grid, target_tokens.device))
         if t_mod.ndim == 4:
@@ -284,8 +327,12 @@ def model_fn_wan_video_tokenlight_pbr(
 
     rgb_tokens = x[:, rgb_start : rgb_start + rgb_len]
     rgb = dit.unpatchify(dit.head(rgb_tokens, t_head), target_grid)
-    if pbr_start is None:
+    if not pbr_segments:
         return rgb
-    pbr_tokens = x[:, pbr_start : pbr_start + pbr_len]
-    pbr = dit.unpatchify(dit.head(pbr_tokens, t_head), target_grid)
-    return rgb, pbr
+    pbr_outputs = {}
+    for stream_name, (pbr_start, pbr_len, pbr_grid) in pbr_segments.items():
+        pbr_tokens = x[:, pbr_start : pbr_start + pbr_len]
+        pbr_outputs[stream_name] = dit.unpatchify(dit.head(pbr_tokens, t_head), pbr_grid)
+    if legacy_pbr_stream:
+        return rgb, next(iter(pbr_outputs.values()))
+    return rgb, pbr_outputs

@@ -34,6 +34,7 @@ from model.illumination_latent_head import (
 
 
 DEFAULT_DATA_ROOT = "data/objaverse_ratio3p5_cube1p6_direct_scene0000_1999_640_png"
+DEFAULT_STATS_MAX_ITEMS = 20000
 
 
 def repo_path(value: str | Path) -> Path:
@@ -48,7 +49,7 @@ def default_metadata_path(data_root: Path) -> Path:
 def default_latent_stats_path(data_root: Path, args: argparse.Namespace) -> Path:
     image_key = str(args.image_key).replace("/", "_")
     task = str(args.task).replace(",", "-") if args.task else "all"
-    stats_items = args.stats_max_items if args.stats_max_items is not None else args.max_items
+    stats_items = args.stats_max_items if args.stats_max_items and args.stats_max_items > 0 else args.max_items
     item_count = f"n{stats_items}" if stats_items is not None else "all"
     seed = f"seed{args.shuffle_seed}" if stats_items is not None and args.shuffle_seed is not None else "seedall"
     name = f"{args.target}_{image_key}_{task}_{args.width}x{args.height}_{item_count}_{seed}.pt"
@@ -164,15 +165,58 @@ def atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
     os.replace(tmp_path, path)
 
 
-def acquire_file_lock(lock_path: Path, *, poll_seconds: float = 5.0) -> int:
+def lock_owner_pid(lock_path: Path) -> int | None:
+    try:
+        text = lock_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def pid_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def pid_looks_like_stats_owner(pid: int) -> bool:
+    cmdline = Path("/proc") / str(pid) / "cmdline"
+    try:
+        text = cmdline.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return pid_is_running(pid)
+    return "train_illumination_latent_head.py" in text
+
+
+def acquire_file_lock(lock_path: Path, *, poll_seconds: float = 5.0, report_seconds: float = 60.0) -> int:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    last_report = 0.0
     while True:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.write(fd, str(os.getpid()).encode("utf-8"))
             return fd
         except FileExistsError:
-            print(f"Waiting for illumination latent stats lock: {lock_path}")
+            owner_pid = lock_owner_pid(lock_path)
+            if owner_pid is not None and (not pid_is_running(owner_pid) or not pid_looks_like_stats_owner(owner_pid)):
+                print(f"Removing stale illumination latent stats lock: {lock_path} pid={owner_pid}")
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
+            now = time.time()
+            if now - last_report >= report_seconds:
+                suffix = f" pid={owner_pid}" if owner_pid is not None else ""
+                print(f"Waiting for illumination latent stats lock: {lock_path}{suffix}")
+                last_report = now
             time.sleep(poll_seconds)
 
 
@@ -192,8 +236,9 @@ def compute_illumination_latent_stats(
     data_root: Path,
     config: IlluminationLatentHeadConfig,
     args: argparse.Namespace,
+    writer=None,
 ) -> dict[str, Any]:
-    stats_rows = rows[: int(args.stats_max_items)] if args.stats_max_items is not None else rows
+    stats_rows = rows[: int(args.stats_max_items)] if args.stats_max_items and args.stats_max_items > 0 else rows
     dataset = IlluminationImageDataset(
         stats_rows,
         data_root=data_root,
@@ -212,6 +257,7 @@ def compute_illumination_latent_stats(
     channel_sum = torch.zeros(config.latent_channels, dtype=torch.float64)
     channel_sq_sum = torch.zeros(config.latent_channels, dtype=torch.float64)
     count = 0
+    processed_images = 0
     iterator = tqdm(dataloader, desc=f"stats {config.target}", leave=False)
     for images in iterator:
         rgb_unit = preprocess_batch(pipe, images, min_value=0, max_value=1)
@@ -222,6 +268,11 @@ def compute_illumination_latent_stats(
         channel_sum += z_illum.sum(dim=reduce_dims)
         channel_sq_sum += z_illum.square().sum(dim=reduce_dims)
         count += z_illum.numel() // z_illum.shape[1]
+        processed_images += len(images)
+        iterator.set_postfix(images=processed_images)
+        if writer is not None:
+            writer.add_scalar("stats/images", processed_images, processed_images)
+            writer.flush()
     if count <= 0:
         raise ValueError("Could not compute illumination latent stats from an empty dataset")
     mean = channel_sum / count
@@ -247,6 +298,7 @@ def load_or_compute_latent_stats(
     data_root: Path,
     config: IlluminationLatentHeadConfig,
     args: argparse.Namespace,
+    writer=None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, dict[str, Any] | None]:
     if not args.normalize_latent_loss:
         return None, None, None
@@ -263,7 +315,14 @@ def load_or_compute_latent_stats(
                 print(f"Loaded illumination latent stats from {stats_path}")
             else:
                 print(f"Computing illumination latent stats: {stats_path}")
-                payload = compute_illumination_latent_stats(pipe, rows, data_root=data_root, config=config, args=args)
+                payload = compute_illumination_latent_stats(
+                    pipe,
+                    rows,
+                    data_root=data_root,
+                    config=config,
+                    args=args,
+                    writer=writer,
+                )
                 atomic_torch_save(payload, stats_path)
                 print(f"Saved illumination latent stats to {stats_path}")
         finally:
@@ -331,7 +390,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent_stats_path", default="")
     parser.add_argument("--force_recompute_latent_stats", action="store_true")
     parser.add_argument("--stats_batch_size", type=int, default=0)
-    parser.add_argument("--stats_max_items", type=int, default=None)
+    parser.add_argument(
+        "--stats_max_items",
+        type=int,
+        default=DEFAULT_STATS_MAX_ITEMS,
+        help="Number of images used for latent mean/std stats. Use 0 for the full selected dataset.",
+    )
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--max_items", type=int, default=None)
@@ -407,17 +471,18 @@ def main() -> None:
         drop_last=True,
     )
     pipe = load_vae_pipe(args)
+    writer = maybe_writer(output_dir, args.enable_tensorboard)
     latent_mean, latent_std, latent_stats_info = load_or_compute_latent_stats(
         pipe,
         rows,
         data_root=data_root,
         config=config,
         args=args,
+        writer=writer,
     )
     head = build_illumination_latent_head(config).to(device=pipe.device, dtype=torch.float32)
     head.train()
     optimizer = torch.optim.AdamW(head.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    writer = maybe_writer(output_dir, args.enable_tensorboard)
 
     global_step = 0
     try:

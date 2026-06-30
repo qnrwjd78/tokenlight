@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from collections import OrderedDict
 from contextlib import nullcontext
 from datetime import datetime
 import importlib
@@ -209,6 +210,162 @@ def _load_module_state_from_checkpoint(module: nn.Module | None, state_dict: dic
         f"Loaded {prefix} from checkpoint: "
         f"tensors={len(module_state)}, missing={len(missing)}, unexpected={len(unexpected)}"
     )
+
+
+def _split_csv_paths(value) -> list[str]:
+    if value in (None, "", "None", "none", "null"):
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value if str(item)]
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def _resolve_path(value: str | Path, *, base_path: str | Path | None = None) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    base = Path(base_path) if base_path not in (None, "") else Path.cwd()
+    if not base.is_absolute():
+        base = Path.cwd() / base
+    return base / path
+
+
+def _relative_to_or_none(path: Path, root: Path) -> str | None:
+    try:
+        return path.resolve(strict=False).relative_to(root.resolve(strict=False)).as_posix()
+    except ValueError:
+        return None
+
+
+class VaeLatentCache:
+    def __init__(self, cache_dirs: list[str], *, max_open_shards: int = 4) -> None:
+        if not cache_dirs:
+            raise ValueError("At least one VAE latent cache directory is required.")
+        self.caches: list[dict] = []
+        self.max_open_shards = max(1, int(max_open_shards))
+        self._open_shards: OrderedDict[tuple[int, str], dict[str, torch.Tensor]] = OrderedDict()
+        for cache_dir in cache_dirs:
+            self._add_cache(Path(cache_dir))
+        if not self.caches:
+            raise ValueError(f"No VAE latent cache indexes found in: {cache_dirs}")
+
+    @staticmethod
+    def _read_json(path: Path) -> dict:
+        if not path.exists():
+            return {}
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+
+    @staticmethod
+    def _index_files(root: Path) -> list[Path]:
+        merged = root / "index.jsonl"
+        if merged.exists():
+            return [merged]
+        return sorted(root.glob("index_part_*.jsonl"))
+
+    def _add_cache(self, cache_dir: Path) -> None:
+        root = _resolve_path(cache_dir)
+        if not root.exists():
+            raise FileNotFoundError(f"Missing VAE latent cache directory: {root}")
+        config = self._read_json(root / "cache_config.json") or self._read_json(root / "cache_summary.json")
+        data_root_value = config.get("data_root")
+        data_root = _resolve_path(data_root_value) if data_root_value else None
+        entries: dict[str, dict] = {}
+        for index_path in self._index_files(root):
+            with index_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    path = row.get("path")
+                    if isinstance(path, str) and path:
+                        entries[path] = row
+        if not entries:
+            raise FileNotFoundError(f"No VAE latent cache index rows found under {root}")
+        self.caches.append({"root": root, "data_root": data_root, "entries": entries})
+        print(
+            "Loaded VAE latent cache index: "
+            f"root={root} data_root={data_root} assets={len(entries)}"
+        )
+
+    def _candidate_paths(self, value: str, *, dataset_base_path: str | Path | None) -> list[tuple[int, str]]:
+        raw = Path(value)
+        abs_path = _resolve_path(raw, base_path=dataset_base_path)
+        candidates: list[tuple[int, str]] = []
+        for cache_index, cache in enumerate(self.caches):
+            data_root = cache.get("data_root")
+            if data_root is not None:
+                rel = _relative_to_or_none(abs_path, data_root)
+                if rel is not None:
+                    candidates.append((cache_index, rel))
+            if not raw.is_absolute():
+                candidates.append((cache_index, raw.as_posix()))
+        return candidates
+
+    def _load_shard(self, cache_index: int, shard: str) -> dict[str, torch.Tensor]:
+        key = (cache_index, shard)
+        cached = self._open_shards.get(key)
+        if cached is not None:
+            self._open_shards.move_to_end(key)
+            return cached
+        from safetensors.torch import load_file
+
+        shard_path = self.caches[cache_index]["root"] / shard
+        tensors = load_file(str(shard_path), device="cpu")
+        self._open_shards[key] = tensors
+        self._open_shards.move_to_end(key)
+        while len(self._open_shards) > self.max_open_shards:
+            self._open_shards.popitem(last=False)
+        return tensors
+
+    def load(self, value: str, *, dataset_base_path: str | Path | None) -> torch.Tensor:
+        for cache_index, rel_path in self._candidate_paths(value, dataset_base_path=dataset_base_path):
+            entry = self.caches[cache_index]["entries"].get(rel_path)
+            if entry is None:
+                continue
+            shard = entry.get("shard")
+            tensor = entry.get("tensor")
+            if not isinstance(shard, str) or not isinstance(tensor, str):
+                raise KeyError(f"Malformed cache index entry for {value!r}: {entry}")
+            tensors = self._load_shard(cache_index, shard)
+            if tensor not in tensors:
+                raise KeyError(f"Tensor {tensor!r} not found in cache shard {shard!r}")
+            return tensors[tensor]
+        raise KeyError(f"Could not find {value!r} in any VAE latent cache.")
+
+
+class VaeLatentCachedDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        dataset,
+        cache: VaeLatentCache,
+        *,
+        dataset_base_path: str | Path | None,
+        target_key: str = "video",
+        source_key: str = "input_image",
+    ) -> None:
+        self.dataset = dataset
+        self.cache = cache
+        self.dataset_base_path = dataset_base_path
+        self.target_key = target_key
+        self.source_key = source_key
+        self.data = dataset.data
+        self.repeat = getattr(dataset, "repeat", 1)
+        self.load_from_cache = False
+
+    def __len__(self) -> int:
+        return len(self.data) * int(self.repeat)
+
+    def __getitem__(self, index: int) -> dict:
+        row = self.data[index % len(self.data)].copy()
+        target_path = row.get(self.target_key)
+        if not isinstance(target_path, str) or not target_path:
+            raise KeyError(f"Missing target image key {self.target_key!r} in metadata row")
+        row["input_latents"] = self.cache.load(target_path, dataset_base_path=self.dataset_base_path)
+        source_path = row.get(self.source_key)
+        if isinstance(source_path, str) and source_path:
+            row["tokenlight_source_latents"] = self.cache.load(source_path, dataset_base_path=self.dataset_base_path)
+        return row
 
 
 def _require_nonempty_light_attrs(attrs: list[dict], *, key: str) -> list[dict]:
@@ -524,6 +681,159 @@ def parse_tokenlight_args(train_mode: str = "single"):
     _resolve_weight_paths(args)
     _append_timestamp_to_output_path(args)
     return args, raw_config, raw_config
+
+
+def _parse_vae_latent_cache_specs(value: str | None) -> list[tuple[Path, Path]]:
+    if value in (None, "", "None", "none", "null"):
+        return []
+    specs: list[tuple[Path, Path]] = []
+    for item in str(value).split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        if "::" in item:
+            metadata_path, cache_dir = item.split("::", 1)
+        elif "=" in item:
+            metadata_path, cache_dir = item.split("=", 1)
+        else:
+            raise ValueError(
+                "Each --vae_latent_cache_specs item must be metadata_path=cache_dir "
+                f"or metadata_path::cache_dir, got {item!r}"
+            )
+        specs.append((_resolve_path(metadata_path.strip(), base_path=REPO_ROOT), _resolve_path(cache_dir.strip(), base_path=REPO_ROOT)))
+    return specs
+
+
+def _read_jsonl_rows(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+class VaeLatentCacheStore:
+    def __init__(self, cache_dir: Path, *, shard_lru: int = 64) -> None:
+        self.cache_dir = cache_dir
+        self.shard_lru = max(0, int(shard_lru))
+        self.index = self._load_index(cache_dir)
+        self._shards: OrderedDict[str, object] = OrderedDict()
+
+    @staticmethod
+    def _load_index(cache_dir: Path) -> dict[str, dict]:
+        index_path = cache_dir / "index.jsonl"
+        if not index_path.exists():
+            part_paths = sorted(cache_dir.glob("index_part_*.jsonl"))
+            if not part_paths:
+                raise FileNotFoundError(f"Missing VAE cache index: {index_path}")
+            rows = []
+            for part_path in part_paths:
+                rows.extend(_read_jsonl_rows(part_path))
+        else:
+            rows = _read_jsonl_rows(index_path)
+        index: dict[str, dict] = {}
+        for row in rows:
+            path = row.get("path")
+            if isinstance(path, str) and path:
+                index[path] = row
+        if not index:
+            raise ValueError(f"No VAE cache entries found in {cache_dir}")
+        return index
+
+    def _open_shard(self, shard_rel: str):
+        from safetensors import safe_open
+
+        shard = self._shards.get(shard_rel)
+        if shard is not None:
+            self._shards.move_to_end(shard_rel)
+            return shard
+        shard_path = self.cache_dir / shard_rel
+        if not shard_path.exists():
+            raise FileNotFoundError(f"Missing VAE cache shard: {shard_path}")
+        shard = safe_open(str(shard_path), framework="pt", device="cpu")
+        self._shards[shard_rel] = shard
+        if self.shard_lru and len(self._shards) > self.shard_lru:
+            self._shards.popitem(last=False)
+        return shard
+
+    def get(self, path: str) -> torch.Tensor:
+        entry = self.index.get(path)
+        if entry is None:
+            raise KeyError(f"Missing VAE latent cache entry for {path!r} in {self.cache_dir}")
+        shard = self._open_shard(str(entry["shard"]))
+        return shard.get_tensor(str(entry["tensor"]))
+
+    def get_optional(self, path: str) -> torch.Tensor | None:
+        entry = self.index.get(path)
+        if entry is None:
+            return None
+        shard = self._open_shard(str(entry["shard"]))
+        return shard.get_tensor(str(entry["tensor"]))
+
+
+class TokenLightVaeLatentCacheDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        specs: list[tuple[Path, Path]],
+        *,
+        data_file_keys: list[str],
+        height: int,
+        width: int,
+        repeat: int = 1,
+        shard_lru: int = 64,
+    ) -> None:
+        if not specs:
+            raise ValueError("TokenLightVaeLatentCacheDataset requires at least one cache spec")
+        self.data_file_keys = [key for key in data_file_keys if key]
+        self.data_file_key_set = set(self.data_file_keys)
+        self.height = int(height)
+        self.width = int(width)
+        self.repeat = int(repeat)
+        self.load_from_cache = False
+        self.skip_tokenlight_file_filter = True
+        self.is_vae_latent_cache_dataset = True
+        self.stores: list[VaeLatentCacheStore] = []
+        self.data: list[dict] = []
+        for source_index, (metadata_path, cache_dir) in enumerate(specs):
+            if not metadata_path.exists():
+                raise FileNotFoundError(f"Missing metadata for VAE cache dataset: {metadata_path}")
+            if not cache_dir.exists():
+                raise FileNotFoundError(f"Missing VAE latent cache dir: {cache_dir}")
+            store = VaeLatentCacheStore(cache_dir, shard_lru=shard_lru)
+            self.stores.append(store)
+            for row in _read_jsonl_rows(metadata_path):
+                item = dict(row)
+                item["_vae_latent_cache_source"] = source_index
+                self.data.append(item)
+        if not self.data:
+            raise ValueError("No metadata rows found for VAE latent cache dataset")
+
+    def __len__(self) -> int:
+        return len(self.data) * self.repeat
+
+    def _make_item(self, index: int) -> dict:
+        row = dict(self.data[index % len(self.data)])
+        store = self.stores[int(row["_vae_latent_cache_source"])]
+        row["_tokenlight_cached_latents"] = True
+        row["_tokenlight_height"] = self.height
+        row["_tokenlight_width"] = self.width
+        if "video" not in row:
+            raise KeyError("Cached TokenLight metadata row is missing required 'video' key")
+        row["_tokenlight_input_latents"] = store.get(str(row["video"]))
+        if "input_image" in row and "input_image" in self.data_file_key_set:
+            row["_tokenlight_source_latents"] = store.get(str(row["input_image"]))
+        if "mask" in row and "mask" in self.data_file_keys:
+            mask_latents = store.get_optional(str(row["mask"]))
+            if mask_latents is not None:
+                row["_tokenlight_mask_latents"] = mask_latents
+        return row
+
+    def __getitem__(self, index: int) -> dict:
+        return self._make_item(index)
+
+    def __getitems__(self, indices: list[int]) -> list[dict]:
+        return [self._make_item(int(index)) for index in indices]
 
 
 def _json_safe_value(value):
@@ -992,6 +1302,7 @@ class TokenLightWanTrainingModule(DiffusionTrainingModule):  # noqa: F405
         tokenlight_cfg_drop_prob=0.0,
         tokenlight_source_tokens=True,
         tokenlight_mask_tokens=True,
+        prompt_context_cache_size=4,
     ):
         super().__init__()
         model_configs = self.parse_model_configs(
@@ -1062,6 +1373,9 @@ class TokenLightWanTrainingModule(DiffusionTrainingModule):  # noqa: F405
         self.extra_inputs = [item for item in extra_inputs.split(",") if item] if extra_inputs is not None else []
         self.fp8_models = fp8_models
         self.task = task
+        self.prompt_context_cache_size = max(0, int(prompt_context_cache_size or 0))
+        self._prompt_context_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+        self._text_encoder_trainable_cache: bool | None = None
         self.task_to_loss = {
             "sft:data_process": lambda pipe, *args: args,
             "direct_distill:data_process": lambda pipe, *args: args,
@@ -1144,15 +1458,141 @@ class TokenLightWanTrainingModule(DiffusionTrainingModule):  # noqa: F405
             return len(video)
         return 1
 
+    @staticmethod
+    def _has_cached_latents(data):
+        return isinstance(data, dict) and "_tokenlight_input_latents" in data
+
+    @staticmethod
+    def _first_scalar(value, default):
+        if isinstance(value, list) and value:
+            return value[0]
+        return default if value in (None, "") else value
+
+    def _stack_cached_latents(self, value, *, batch: int, name: str) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            tensor = value.unsqueeze(0) if value.ndim == 4 else value
+        elif isinstance(value, list):
+            tensors = []
+            for item in value:
+                if not isinstance(item, torch.Tensor):
+                    raise TypeError(f"Expected tensor for cached {name}, got {type(item).__name__}")
+                tensors.append(item)
+            tensor = torch.stack(tensors, dim=0)
+        else:
+            raise TypeError(f"Missing cached {name} latents")
+        if tensor.ndim != 5:
+            raise ValueError(f"Expected cached {name} latents with shape [B,C,T,H,W], got {tuple(tensor.shape)}")
+        if int(tensor.shape[0]) != int(batch):
+            raise ValueError(f"Cached {name} batch size mismatch: {tensor.shape[0]} != {batch}")
+        try:
+            non_blocking = bool(tensor.is_pinned())
+        except RuntimeError:
+            non_blocking = False
+        return tensor.to(dtype=self.pipe.torch_dtype, device=self.pipe.device, non_blocking=non_blocking)
+
+    def _cached_batched_inputs(self, data):
+        batch = self._batch_size_from_data(data)
+        prompts = data.get("prompt")
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        if not isinstance(prompts, list) or len(prompts) != batch:
+            raise ValueError(f"Expected {batch} prompts for cached VAE training")
+
+        input_latents = self._stack_cached_latents(
+            data.get("_tokenlight_input_latents"),
+            batch=batch,
+            name="input",
+        )
+        height = int(self._first_scalar(data.get("_tokenlight_height"), input_latents.shape[-2] * 16))
+        width = int(self._first_scalar(data.get("_tokenlight_width"), input_latents.shape[-1] * 16))
+        inputs_posi = {"prompt": prompts, "context": self._encode_prompts(prompts)}
+        inputs_nega = {}
+        inputs_shared = {
+            "input_video": None,
+            "input_latents": input_latents,
+            "height": height,
+            "width": width,
+            "num_frames": int(input_latents.shape[2]),
+            "cfg_scale": 1,
+            "tiled": False,
+            "rand_device": self.pipe.device,
+            "use_gradient_checkpointing": self.use_gradient_checkpointing,
+            "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
+            "cfg_merge": False,
+            "vace_scale": 1,
+            "max_timestep_boundary": self.max_timestep_boundary,
+            "min_timestep_boundary": self.min_timestep_boundary,
+        }
+
+        if self.tokenlight_source_tokens:
+            source_latents = data.get("_tokenlight_source_latents")
+            if source_latents is None:
+                source_latents = data.get("_tokenlight_input_latents")
+            inputs_shared["tokenlight_source_latents"] = self._stack_cached_latents(
+                source_latents,
+                batch=batch,
+                name="source",
+            )
+
+        if self.tokenlight_mask_tokens:
+            mask_latents = data.get("_tokenlight_mask_latents")
+            if mask_latents is None:
+                inputs_shared["tokenlight_mask_latents"] = torch.zeros_like(input_latents)
+            else:
+                inputs_shared["tokenlight_mask_latents"] = self._stack_cached_latents(
+                    mask_latents,
+                    batch=batch,
+                    name="mask",
+                )
+
+        attrs = attrs_from_batch(data, key=self.tokenlight_attrs_key)
+        if self.light_encoder is not None:
+            attrs = _require_nonempty_light_attrs(attrs, key=self.tokenlight_attrs_key)
+            drop_light = False
+            if self.training and self.tokenlight_cfg_drop_prob > 0:
+                drop_light = torch.rand(batch, device=inputs_posi["context"].device) < self.tokenlight_cfg_drop_prob
+            inputs_posi["tokenlight_drop_light"] = drop_light
+            inputs_nega["tokenlight_drop_light"] = True
+        inputs_shared["tokenlight_attrs"] = attrs
+        return inputs_shared, inputs_posi, inputs_nega
+
+    def _text_encoder_has_trainable_parameters(self) -> bool:
+        if self._text_encoder_trainable_cache is not None:
+            return self._text_encoder_trainable_cache
+        text_encoder = getattr(self.pipe, "text_encoder", None)
+        if not isinstance(text_encoder, nn.Module):
+            self._text_encoder_trainable_cache = False
+        else:
+            self._text_encoder_trainable_cache = any(param.requires_grad for param in text_encoder.parameters())
+        return self._text_encoder_trainable_cache
+
     def _encode_prompts(self, prompts):
+        prompt_key = tuple(str(prompt) for prompt in prompts)
+        can_cache = self.prompt_context_cache_size > 0 and not self._text_encoder_has_trainable_parameters()
+        cache_key = None
+        if can_cache:
+            cache_key = (prompt_key, str(self.pipe.device), str(self.pipe.torch_dtype))
+            cached = self._prompt_context_cache.get(cache_key)
+            if cached is not None:
+                self._prompt_context_cache.move_to_end(cache_key)
+                return cached
+
         self.pipe.load_models_to_device(["text_encoder"])
         ids, mask = self.pipe.tokenizer(prompts, return_mask=True, add_special_tokens=True)
         ids = ids.to(self.pipe.device)
         mask = mask.to(self.pipe.device)
         seq_lens = mask.gt(0).sum(dim=1).long()
-        prompt_emb = self.pipe.text_encoder(ids, mask)
+        context = torch.no_grad() if can_cache else nullcontext()
+        with context:
+            prompt_emb = self.pipe.text_encoder(ids, mask)
         for index, seq_len in enumerate(seq_lens):
             prompt_emb[index, seq_len:] = 0
+        if cache_key is not None:
+            prompt_emb = prompt_emb.detach()
+            self._prompt_context_cache[cache_key] = prompt_emb
+            self._prompt_context_cache.move_to_end(cache_key)
+            while len(self._prompt_context_cache) > self.prompt_context_cache_size:
+                self._prompt_context_cache.popitem(last=False)
         return prompt_emb
 
     def _preprocess_videos_batched(self, videos):
@@ -1296,6 +1736,9 @@ class TokenLightWanTrainingModule(DiffusionTrainingModule):  # noqa: F405
         return inputs_shared, inputs_posi, inputs_nega
 
     def forward(self, data, inputs=None):
+        if inputs is None and self._has_cached_latents(data):
+            inputs = self._cached_batched_inputs(data)
+            return self.task_to_loss[self.task](self.pipe, *inputs)
         if inputs is None and self._is_collated_batch(data):
             inputs = self._batched_inputs(data)
             return self.task_to_loss[self.task](self.pipe, *inputs)
@@ -1341,8 +1784,27 @@ def wan_parser(train_mode: str = "single") -> argparse.ArgumentParser:
     parser.add_argument("--dataset_base_path", type=str, default=None)
     parser.add_argument("--dataset_metadata_path", type=str, default=None)
     parser.add_argument("--data_file_keys", type=str, default="video,input_image")
+    parser.add_argument(
+        "--vae_latent_cache_specs",
+        type=str,
+        default=None,
+        help=(
+            "Semicolon-separated metadata/cache pairs for precomputed VAE latents, "
+            "for example metadata.jsonl=vae_latent_cache;other.jsonl=other_cache."
+        ),
+    )
+    parser.add_argument(
+        "--vae_latent_cache_shard_lru",
+        type=int,
+        default=64,
+        help="Number of safetensors shard handles to keep open per dataset worker.",
+    )
     parser.add_argument("--dataset_repeat", type=int, default=1)
     parser.add_argument("--dataset_num_workers", type=int, default=0)
+    parser.add_argument("--dataset_auto_workers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dataset_pin_memory", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--dataset_persistent_workers", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--dataset_prefetch_factor", type=int, default=2)
     parser.add_argument("--height", type=int, default=704)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--num_frames", type=int, default=1)
@@ -1390,6 +1852,7 @@ def wan_parser(train_mode: str = "single") -> argparse.ArgumentParser:
     parser.add_argument("--extra_inputs", type=str, default=None)
     parser.add_argument("--fp8_models", type=str, default=None)
     parser.add_argument("--offload_models", type=str, default=None)
+    parser.add_argument("--prompt_context_cache_size", type=int, default=4)
 
     parser.add_argument("--tokenlight_light_tokens", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tokenlight_source_tokens", action=argparse.BooleanOptionalAction, default=True)
@@ -1412,33 +1875,49 @@ def wan_parser(train_mode: str = "single") -> argparse.ArgumentParser:
 
 
 def build_dataset(args):
-    dataset = UnifiedDataset(
-        base_path=args.dataset_base_path,
-        metadata_path=args.dataset_metadata_path,
-        repeat=args.dataset_repeat,
-        data_file_keys=args.data_file_keys.split(","),
-        main_data_operator=UnifiedDataset.default_video_operator(
-            base_path=args.dataset_base_path,
-            max_pixels=args.max_pixels,
+    data_file_keys = [key for key in args.data_file_keys.split(",") if key]
+    cache_specs = _parse_vae_latent_cache_specs(getattr(args, "vae_latent_cache_specs", None))
+    if cache_specs:
+        dataset = TokenLightVaeLatentCacheDataset(
+            cache_specs,
+            data_file_keys=data_file_keys,
             height=args.height,
             width=args.width,
-            height_division_factor=16,
-            width_division_factor=16,
-            num_frames=args.num_frames,
-            time_division_factor=4 if not args.framewise_decoding else 1,
-            time_division_remainder=1 if not args.framewise_decoding else 0,
-        ),
-        special_operator_map={
-            "animate_face_video": ToAbsolutePath(args.dataset_base_path)
-            >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
-            "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
-            "wantodance_music_path": ToAbsolutePath(args.dataset_base_path),
-        },
-    )
+            repeat=args.dataset_repeat,
+            shard_lru=int(getattr(args, "vae_latent_cache_shard_lru", 64)),
+        )
+    else:
+        dataset = UnifiedDataset(
+            base_path=args.dataset_base_path,
+            metadata_path=args.dataset_metadata_path,
+            repeat=args.dataset_repeat,
+            data_file_keys=data_file_keys,
+            main_data_operator=UnifiedDataset.default_video_operator(
+                base_path=args.dataset_base_path,
+                max_pixels=args.max_pixels,
+                height=args.height,
+                width=args.width,
+                height_division_factor=16,
+                width_division_factor=16,
+                num_frames=args.num_frames,
+                time_division_factor=4 if not args.framewise_decoding else 1,
+                time_division_remainder=1 if not args.framewise_decoding else 0,
+            ),
+            special_operator_map={
+                "animate_face_video": ToAbsolutePath(args.dataset_base_path)
+                >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
+                "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
+                "wantodance_music_path": ToAbsolutePath(args.dataset_base_path),
+            },
+        )
     if dataset.data:
         original_count = len(dataset.data)
         normalized = _normalize_tokenlight_metadata_rows(dataset.data)
-        filtered, filter_stats = _filter_tokenlight_metadata_rows(normalized, args.dataset_base_path)
+        if getattr(dataset, "skip_tokenlight_file_filter", False):
+            filtered = [row for row in normalized if row.get("valid") is not False]
+            filter_stats = {"row_invalid": len(normalized) - len(filtered)}
+        else:
+            filtered, filter_stats = _filter_tokenlight_metadata_rows(normalized, args.dataset_base_path)
         removed = original_count - len(filtered)
         if len(normalized) != original_count or removed:
             nonzero_stats = {key: value for key, value in filter_stats.items() if value}
@@ -1451,11 +1930,97 @@ def build_dataset(args):
     return dataset
 
 
+_CACHED_LATENT_BATCH_KEYS = {
+    "_tokenlight_input_latents",
+    "_tokenlight_source_latents",
+    "_tokenlight_mask_latents",
+}
+
+
+def _stack_tensor_values(values: list):
+    if not values or not all(isinstance(value, torch.Tensor) for value in values):
+        return None
+    try:
+        return torch.stack(values, dim=0)
+    except RuntimeError:
+        return None
+
+
 def _collate_tokenlight_batch(batch):
     if len(batch) == 1:
         return batch[0]
     keys = sorted({key for item in batch for key in item.keys()})
-    return {key: [item.get(key) for item in batch] for key in keys}
+    result = {}
+    for key in keys:
+        values = [item.get(key) for item in batch]
+        if key in _CACHED_LATENT_BATCH_KEYS:
+            stacked = _stack_tensor_values(values)
+            if stacked is not None:
+                result[key] = stacked
+            elif key in {"_tokenlight_source_latents", "_tokenlight_mask_latents"}:
+                continue
+            else:
+                result[key] = values
+        else:
+            result[key] = values
+    return result
+
+
+def _optional_bool(value, *, default: bool) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"", "none", "null"}:
+        return bool(default)
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(value)
+
+
+def _dataloader_runtime_kwargs(args, dataset, *, num_workers: int, accelerator=None) -> dict:
+    is_cached = bool(getattr(dataset, "is_vae_latent_cache_dataset", False))
+    cuda_available = bool(torch.cuda.is_available())
+    requested_workers = int(num_workers)
+    effective_workers = requested_workers
+    if (
+        is_cached
+        and requested_workers <= 0
+        and _optional_bool(getattr(args, "dataset_auto_workers", True), default=True)
+    ):
+        num_processes = max(1, int(getattr(accelerator, "num_processes", 1) or 1))
+        cpu_count = max(1, int(os.cpu_count() or 1))
+        effective_workers = max(1, min(4, cpu_count // num_processes))
+    pin_memory = _optional_bool(
+        getattr(args, "dataset_pin_memory", None),
+        default=is_cached and cuda_available,
+    )
+    kwargs = {
+        "num_workers": effective_workers,
+        "pin_memory": pin_memory,
+    }
+    if effective_workers > 0:
+        kwargs["persistent_workers"] = _optional_bool(
+            getattr(args, "dataset_persistent_workers", None),
+            default=is_cached,
+        )
+        prefetch_factor = int(getattr(args, "dataset_prefetch_factor", 2) or 0)
+        if prefetch_factor > 0:
+            kwargs["prefetch_factor"] = prefetch_factor
+    if accelerator is None or getattr(accelerator, "is_main_process", True):
+        print(
+            "DataLoader setup: "
+            f"cached={is_cached}, "
+            f"num_workers={kwargs['num_workers']}"
+            f"{f' (auto from {requested_workers})' if kwargs['num_workers'] != requested_workers else ''}, "
+            f"pin_memory={kwargs['pin_memory']}, "
+            f"persistent_workers={kwargs.get('persistent_workers', False)}, "
+            f"prefetch_factor={kwargs.get('prefetch_factor', None)}"
+        )
+    return kwargs
 
 
 def _parse_balanced_task_batch(value) -> dict[str, int] | None:
@@ -1572,14 +2137,15 @@ def launch_tokenlight_training_task(
     optimizer = optimizer_class(_trainable_parameters(model), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     task_batch = _parse_balanced_task_batch(getattr(args, "balanced_task_batch", None))
+    dataloader_kwargs = _dataloader_runtime_kwargs(args, dataset, num_workers=num_workers, accelerator=accelerator)
     if task_batch is None:
         dataloader = torch.utils.data.DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=True,
             collate_fn=_collate_tokenlight_batch,
-            num_workers=num_workers,
             drop_last=batch_size > 1,
+            **dataloader_kwargs,
         )
     else:
         if sum(task_batch.values()) != batch_size:
@@ -1592,7 +2158,7 @@ def launch_tokenlight_training_task(
                 seed=int(getattr(args, "balanced_batch_seed", 0)),
             ),
             collate_fn=_collate_tokenlight_batch,
-            num_workers=num_workers,
+            **dataloader_kwargs,
         )
 
     _configure_deepspeed_batch_size(accelerator, args, batch_size)
@@ -1725,6 +2291,7 @@ def main(train_mode: str = "single") -> None:
         tokenlight_cfg_drop_prob=args.tokenlight_cfg_drop_prob,
         tokenlight_source_tokens=args.tokenlight_source_tokens,
         tokenlight_mask_tokens=args.tokenlight_mask_tokens,
+        prompt_context_cache_size=args.prompt_context_cache_size,
     )
     model_logger = _make_model_logger(args)
     launcher_map = {

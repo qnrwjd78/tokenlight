@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
@@ -52,6 +53,7 @@ def ensure_runtime_imports(*, include_model: bool) -> None:
 
 @dataclass(frozen=True)
 class CacheAsset:
+    asset_index: int
     path: str
     keys: tuple[str, ...]
 
@@ -119,7 +121,18 @@ def discover_assets(
                 break
         if max_items is not None and len(key_map) >= max_items:
             break
-    return [CacheAsset(path=path, keys=tuple(sorted(keys))) for path, keys in key_map.items()]
+    return [
+        CacheAsset(asset_index=index, path=path, keys=tuple(sorted(keys)))
+        for index, (path, keys) in enumerate(key_map.items())
+    ]
+
+
+def partition_assets(assets: list[CacheAsset], *, partition_count: int, partition_index: int) -> list[CacheAsset]:
+    if partition_count <= 1:
+        return assets
+    if partition_index < 0 or partition_index >= partition_count:
+        raise ValueError(f"partition_index must be in [0, {partition_count}), got {partition_index}")
+    return assets[partition_index::partition_count]
 
 
 def cache_id(path: str) -> str:
@@ -266,6 +279,8 @@ def dry_run_summary(args: argparse.Namespace, assets: list[CacheAsset], rows: li
         "row_count": len(rows),
         "asset_count": len(assets),
         "asset_counts_by_key": asset_counts(assets),
+        "partition_count": int(args.partition_count),
+        "partition_index": int(args.partition_index),
         "estimated_latent_shape_per_asset": [
             int(args.latent_channels),
             1,
@@ -278,27 +293,18 @@ def dry_run_summary(args: argparse.Namespace, assets: list[CacheAsset], rows: li
     }
 
 
-def build_cache(args: argparse.Namespace) -> dict[str, Any]:
-    if args.gpu_devices:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_devices)
-
-    data_root = repo_path(args.data_root)
-    metadata_path = repo_path(args.metadata_path) if args.metadata_path else default_metadata_path(data_root)
-    output_dir = repo_path(args.output_dir) if args.output_dir else default_output_dir(data_root)
-    image_keys = csv_items(args.image_keys)
-
-    rows = load_metadata_rows(metadata_path, limit_rows=args.limit_rows)
-    assets = discover_assets(rows, data_root=data_root, image_keys=image_keys, max_items=args.max_items)
-    if not assets:
-        raise ValueError(f"No image assets found for keys {image_keys} in {metadata_path}")
-
-    if args.dry_run:
-        summary = dry_run_summary(args, assets, rows)
-        print(json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True))
-        return summary
-
-    prepare_output_dir(output_dir, overwrite=bool(args.overwrite))
-    config = {
+def cache_config(
+    args: argparse.Namespace,
+    *,
+    data_root: Path,
+    metadata_path: Path,
+    output_dir: Path,
+    image_keys: list[str],
+    rows: list[dict[str, Any]],
+    all_assets: list[CacheAsset],
+    assets: list[CacheAsset],
+) -> dict[str, Any]:
+    return {
         "cache_version": CACHE_VERSION,
         "data_root": data_root.as_posix(),
         "metadata_path": metadata_path.as_posix(),
@@ -318,10 +324,211 @@ def build_cache(args: argparse.Namespace) -> dict[str, Any]:
         "batch_size": int(args.batch_size),
         "shard_size": int(args.shard_size),
         "row_count": len(rows),
-        "asset_count": len(assets),
-        "asset_counts_by_key": asset_counts(assets),
+        "asset_count": len(all_assets),
+        "partition_asset_count": len(assets),
+        "asset_counts_by_key": asset_counts(all_assets),
+        "partition_count": int(args.partition_count),
+        "partition_index": int(args.partition_index),
     }
+
+
+def gpu_device_items(value: str) -> list[str]:
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def should_launch_multi_gpu(args: argparse.Namespace) -> bool:
+    return (
+        not bool(args.multi_gpu_worker)
+        and not bool(args.dry_run)
+        and int(args.partition_count) == 1
+        and len(gpu_device_items(args.gpu_devices)) > 1
+    )
+
+
+def build_worker_command(args: argparse.Namespace, *, gpu: str, partition_count: int, partition_index: int) -> list[str]:
+    script = Path(__file__).resolve()
+    cmd = [
+        sys.executable,
+        str(script),
+        "--data-root",
+        str(args.data_root),
+        "--metadata-path",
+        str(args.metadata_path),
+        "--output-dir",
+        str(args.output_dir),
+        "--image-keys",
+        str(args.image_keys),
+        "--height",
+        str(args.height),
+        "--width",
+        str(args.width),
+        "--weights-dir",
+        str(args.weights_dir),
+        "--vae-path",
+        str(args.vae_path),
+        "--gpu-devices",
+        str(gpu),
+        "--device",
+        str(args.device),
+        "--batch-size",
+        str(args.batch_size),
+        "--num-workers",
+        str(args.num_workers),
+        "--shard-size",
+        str(args.shard_size),
+        "--vae-dtype",
+        str(args.vae_dtype),
+        "--save-dtype",
+        str(args.save_dtype),
+        "--tile-size",
+        str(args.tile_size[0]),
+        str(args.tile_size[1]),
+        "--tile-stride",
+        str(args.tile_stride[0]),
+        str(args.tile_stride[1]),
+        "--partition-count",
+        str(partition_count),
+        "--partition-index",
+        str(partition_index),
+        "--shard-prefix",
+        f"part_{partition_index:02d}_",
+        "--skip-output-prepare",
+        "--multi-gpu-worker",
+    ]
+    cmd.append("--vae-tiled" if args.vae_tiled else "--no-vae-tiled")
+    if args.limit_rows is not None:
+        cmd.extend(["--limit-rows", str(args.limit_rows)])
+    if args.max_items is not None:
+        cmd.extend(["--max-items", str(args.max_items)])
+    return cmd
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+def merge_partition_indexes(output_dir: Path, *, partition_count: int) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for partition_index in range(partition_count):
+        part_path = output_dir / f"index_part_{partition_index:02d}.jsonl"
+        if not part_path.exists():
+            raise FileNotFoundError(f"Missing partition index: {part_path}")
+        rows.extend(read_jsonl(part_path))
+    rows.sort(key=lambda row: int(row.get("asset_index", 0)))
+    write_index(output_dir / "index.jsonl", rows)
+    return rows
+
+
+def launch_multi_gpu(args: argparse.Namespace) -> dict[str, Any]:
+    devices = gpu_device_items(args.gpu_devices)
+    if len(devices) <= 1:
+        return build_cache(args)
+
+    data_root = repo_path(args.data_root)
+    metadata_path = repo_path(args.metadata_path) if args.metadata_path else default_metadata_path(data_root)
+    output_dir = repo_path(args.output_dir) if args.output_dir else default_output_dir(data_root)
+    image_keys = csv_items(args.image_keys)
+
+    rows = load_metadata_rows(metadata_path, limit_rows=args.limit_rows)
+    assets = discover_assets(rows, data_root=data_root, image_keys=image_keys, max_items=args.max_items)
+    if not assets:
+        raise ValueError(f"No image assets found for keys {image_keys} in {metadata_path}")
+
+    prepare_output_dir(output_dir, overwrite=bool(args.overwrite))
+    config = cache_config(
+        args,
+        data_root=data_root,
+        metadata_path=metadata_path,
+        output_dir=output_dir,
+        image_keys=image_keys,
+        rows=rows,
+        all_assets=assets,
+        assets=assets,
+    )
+    config["gpu_devices"] = ",".join(devices)
+    config["multi_gpu_worker_count"] = len(devices)
     write_json(output_dir / "cache_config.json", config)
+
+    print(
+        f"[vae-cache] launching {len(devices)} GPU workers: {','.join(devices)} "
+        f"assets={len(assets)} output={output_dir}",
+        flush=True,
+    )
+    processes = []
+    for partition_index, gpu in enumerate(devices):
+        cmd = build_worker_command(
+            args,
+            gpu=gpu,
+            partition_count=len(devices),
+            partition_index=partition_index,
+        )
+        processes.append((gpu, subprocess.Popen(cmd, cwd=REPO_ROOT)))
+
+    failed: list[tuple[str, int]] = []
+    for gpu, process in processes:
+        code = process.wait()
+        if code != 0:
+            failed.append((gpu, code))
+    if failed:
+        detail = ", ".join(f"gpu {gpu}: exit {code}" for gpu, code in failed)
+        raise RuntimeError(f"VAE cache worker failed ({detail})")
+
+    merged_rows = merge_partition_indexes(output_dir, partition_count=len(devices))
+    shard_count = len(list((output_dir / "shards").glob("*.safetensors")))
+    summary = {
+        **config,
+        "shard_count": shard_count,
+        "index_path": (output_dir / "index.jsonl").as_posix(),
+        "merged_index_rows": len(merged_rows),
+    }
+    write_json(output_dir / "cache_summary.json", summary)
+    print(json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True))
+    return summary
+
+
+def build_cache(args: argparse.Namespace) -> dict[str, Any]:
+    if args.gpu_devices:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_devices)
+
+    data_root = repo_path(args.data_root)
+    metadata_path = repo_path(args.metadata_path) if args.metadata_path else default_metadata_path(data_root)
+    output_dir = repo_path(args.output_dir) if args.output_dir else default_output_dir(data_root)
+    image_keys = csv_items(args.image_keys)
+
+    rows = load_metadata_rows(metadata_path, limit_rows=args.limit_rows)
+    all_assets = discover_assets(rows, data_root=data_root, image_keys=image_keys, max_items=args.max_items)
+    assets = partition_assets(
+        all_assets,
+        partition_count=int(args.partition_count),
+        partition_index=int(args.partition_index),
+    )
+    if not all_assets:
+        raise ValueError(f"No image assets found for keys {image_keys} in {metadata_path}")
+
+    if args.dry_run:
+        summary = dry_run_summary(args, assets, rows)
+        print(json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True))
+        return summary
+
+    if not args.skip_output_prepare:
+        prepare_output_dir(output_dir, overwrite=bool(args.overwrite))
+    config = cache_config(
+        args,
+        data_root=data_root,
+        metadata_path=metadata_path,
+        output_dir=output_dir,
+        image_keys=image_keys,
+        rows=rows,
+        all_assets=all_assets,
+        assets=assets,
+    )
+    if not args.skip_output_prepare:
+        write_json(output_dir / "cache_config.json", config)
 
     pipe = load_vae_pipe(args)
     dataset = ImageAssetDataset(assets, data_root=data_root, width=args.width, height=args.height)
@@ -344,7 +551,7 @@ def build_cache(args: argparse.Namespace) -> dict[str, Any]:
         nonlocal shard_index, shard_tensors, shard_rows
         if not shard_tensors:
             return
-        shard_rel = Path("shards") / f"shard_{shard_index:06d}.safetensors"
+        shard_rel = Path("shards") / f"{args.shard_prefix}shard_{shard_index:06d}.safetensors"
         shard_path = output_dir / shard_rel
         atomic_save_safetensors(
             shard_tensors,
@@ -373,7 +580,8 @@ def build_cache(args: argparse.Namespace) -> dict[str, Any]:
             shard_tensors[tensor_name] = latent
             shard_rows.append(
                 {
-                    "asset_index": int(asset_index),
+                    "asset_index": int(asset.asset_index),
+                    "partition_index": int(args.partition_index),
                     "path": path,
                     "keys": list(asset.keys),
                     "tensor": tensor_name,
@@ -386,13 +594,23 @@ def build_cache(args: argparse.Namespace) -> dict[str, Any]:
         iterator.set_postfix({"assets": len(index_rows) + len(shard_rows)})
     flush_shard()
 
-    write_index(output_dir / "index.jsonl", index_rows)
+    index_name = (
+        f"index_part_{int(args.partition_index):02d}.jsonl"
+        if int(args.partition_count) > 1
+        else "index.jsonl"
+    )
+    write_index(output_dir / index_name, index_rows)
     summary = {
         **config,
         "shard_count": shard_index,
-        "index_path": (output_dir / "index.jsonl").as_posix(),
+        "index_path": (output_dir / index_name).as_posix(),
     }
-    write_json(output_dir / "cache_summary.json", summary)
+    summary_name = (
+        f"cache_summary_part_{int(args.partition_index):02d}.json"
+        if int(args.partition_count) > 1
+        else "cache_summary.json"
+    )
+    write_json(output_dir / summary_name, summary)
     print(json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True))
     return summary
 
@@ -424,6 +642,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--tile-stride", type=int, nargs=2, default=(15, 26))
     p.add_argument("--limit-rows", type=int, default=None)
     p.add_argument("--max-items", type=int, default=None)
+    p.add_argument("--partition-count", type=int, default=1)
+    p.add_argument("--partition-index", type=int, default=0)
+    p.add_argument("--shard-prefix", default="")
+    p.add_argument("--skip-output-prepare", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--multi-gpu-worker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--latent-channels", type=int, default=48, help="Only used for --dry-run size estimates.")
@@ -433,7 +656,11 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    build_cache(parser().parse_args())
+    args = parser().parse_args()
+    if should_launch_multi_gpu(args):
+        launch_multi_gpu(args)
+    else:
+        build_cache(args)
     return 0
 
 

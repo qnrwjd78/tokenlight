@@ -12,8 +12,11 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from PIL import Image
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 
@@ -35,6 +38,103 @@ from model.illumination_latent_head import (
 
 DEFAULT_DATA_ROOT = "data/objaverse_ratio3p5_cube1p6_direct_scene0000_1999_640_png"
 DEFAULT_STATS_MAX_ITEMS = 20000
+
+
+def distributed_is_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def distributed_world_size() -> int:
+    return dist.get_world_size() if distributed_is_initialized() else 1
+
+
+def distributed_rank() -> int:
+    return dist.get_rank() if distributed_is_initialized() else 0
+
+
+def distributed_local_rank() -> int:
+    return int(os.environ.get("LOCAL_RANK", "0"))
+
+
+def is_main_process() -> bool:
+    return distributed_rank() == 0
+
+
+def log(message: str, *, main_only: bool = True) -> None:
+    if not main_only or is_main_process():
+        print(message, flush=True)
+
+
+def setup_distributed(args: argparse.Namespace) -> dict[str, Any]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    requested_device = str(args.device)
+    args.requested_device = requested_device
+    if world_size <= 1:
+        return {
+            "distributed": False,
+            "rank": 0,
+            "local_rank": 0,
+            "world_size": 1,
+            "backend": None,
+            "requested_device": requested_device,
+            "device": str(args.device),
+        }
+
+    use_cuda = torch.cuda.is_available() and requested_device.startswith("cuda")
+    backend = "nccl" if use_cuda else "gloo"
+    if use_cuda:
+        torch.cuda.set_device(local_rank)
+        args.device = f"cuda:{local_rank}"
+    elif requested_device.startswith("cuda"):
+        args.device = "cpu"
+
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend)
+
+    return {
+        "distributed": True,
+        "rank": rank,
+        "local_rank": local_rank,
+        "world_size": world_size,
+        "backend": backend,
+        "requested_device": requested_device,
+        "device": str(args.device),
+    }
+
+
+def cleanup_distributed() -> None:
+    if distributed_is_initialized():
+        dist.destroy_process_group()
+
+
+def broadcast_run_timestamp() -> str:
+    value = datetime.now().strftime("%Y%m%d_%H%M%S") if is_main_process() else ""
+    if distributed_is_initialized():
+        values = [value]
+        dist.broadcast_object_list(values, src=0)
+        value = str(values[0])
+    return value
+
+
+def unwrap_head(head: torch.nn.Module) -> torch.nn.Module:
+    return head.module if isinstance(head, DistributedDataParallel) else head
+
+
+def average_metric_tensors(metrics: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    if not distributed_is_initialized():
+        return metrics
+    averaged: dict[str, torch.Tensor] = {}
+    world_size = float(distributed_world_size())
+    for key, value in metrics.items():
+        tensor = value.detach().float()
+        if tensor.ndim != 0:
+            tensor = tensor.mean()
+        tensor = tensor.clone()
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        averaged[key] = tensor / world_size
+    return averaged
 
 
 def repo_path(value: str | Path) -> Path:
@@ -239,6 +339,11 @@ def compute_illumination_latent_stats(
     writer=None,
 ) -> dict[str, Any]:
     stats_rows = rows[: int(args.stats_max_items)] if args.stats_max_items and args.stats_max_items > 0 else rows
+    total_stats_rows = len(stats_rows)
+    if distributed_is_initialized():
+        rank = distributed_rank()
+        world_size = distributed_world_size()
+        stats_rows = stats_rows[rank::world_size]
     dataset = IlluminationImageDataset(
         stats_rows,
         data_root=data_root,
@@ -254,40 +359,50 @@ def compute_illumination_latent_stats(
         collate_fn=collate_images,
         drop_last=False,
     )
-    channel_sum = torch.zeros(config.latent_channels, dtype=torch.float64)
-    channel_sq_sum = torch.zeros(config.latent_channels, dtype=torch.float64)
-    count = 0
+    stats_device = pipe.device if distributed_is_initialized() else torch.device("cpu")
+    channel_sum = torch.zeros(config.latent_channels, dtype=torch.float64, device=stats_device)
+    channel_sq_sum = torch.zeros(config.latent_channels, dtype=torch.float64, device=stats_device)
+    count = torch.zeros((), dtype=torch.float64, device=stats_device)
     processed_images = 0
-    iterator = tqdm(dataloader, desc=f"stats {config.target}", leave=False)
+    iterator = tqdm(dataloader, desc=f"stats {config.target}", leave=False, disable=not is_main_process())
     for images in iterator:
         rgb_unit = preprocess_batch(pipe, images, min_value=0, max_value=1)
         illum_unit = make_illumination_image_tensor(rgb_unit, target=config.target, eps=config.eps)
         illum_vae = unit_to_vae_range(illum_unit)
-        z_illum = encode_latents(pipe, illum_vae, args).cpu().double()
+        z_illum = encode_latents(pipe, illum_vae, args).to(device=stats_device, dtype=torch.float64)
         reduce_dims = tuple(dim for dim in range(z_illum.ndim) if dim != 1)
         channel_sum += z_illum.sum(dim=reduce_dims)
         channel_sq_sum += z_illum.square().sum(dim=reduce_dims)
-        count += z_illum.numel() // z_illum.shape[1]
+        count += z_illum.new_tensor(z_illum.numel() // z_illum.shape[1], dtype=torch.float64)
         processed_images += len(images)
-        iterator.set_postfix(images=processed_images)
-        if writer is not None:
+        if is_main_process():
+            iterator.set_postfix(images=processed_images)
+        if writer is not None and is_main_process():
             writer.add_scalar("stats/images", processed_images, processed_images)
             writer.flush()
-    if count <= 0:
+
+    if distributed_is_initialized():
+        dist.all_reduce(channel_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(channel_sq_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+
+    count_value = int(count.item())
+    if count_value <= 0:
         raise ValueError("Could not compute illumination latent stats from an empty dataset")
     mean = channel_sum / count
     var = (channel_sq_sum / count - mean.square()).clamp_min(float(args.latent_std_min) ** 2)
     std = var.sqrt().clamp_min(float(args.latent_std_min))
     return {
-        "mean": mean.float(),
-        "std": std.float(),
-        "count": count,
+        "mean": mean.detach().cpu().float(),
+        "std": std.detach().cpu().float(),
+        "count": count_value,
         "target": config.target,
         "image_key": args.image_key,
         "width": args.width,
         "height": args.height,
-        "row_count": len(stats_rows),
+        "row_count": total_stats_rows,
         "stats_max_items": args.stats_max_items,
+        "distributed_world_size": distributed_world_size(),
     }
 
 
@@ -303,18 +418,32 @@ def load_or_compute_latent_stats(
     if not args.normalize_latent_loss:
         return None, None, None
     stats_path = repo_path(args.latent_stats_path) if args.latent_stats_path else default_latent_stats_path(data_root, args)
-    if stats_path.exists() and not args.force_recompute_latent_stats:
+
+    if distributed_is_initialized() and (args.force_recompute_latent_stats or not stats_path.exists()):
+        log(f"Computing distributed illumination latent stats: {stats_path}")
+        payload = compute_illumination_latent_stats(
+            pipe,
+            rows,
+            data_root=data_root,
+            config=config,
+            args=args,
+            writer=writer,
+        )
+        if is_main_process():
+            atomic_torch_save(payload, stats_path)
+            log(f"Saved illumination latent stats to {stats_path}")
+    elif stats_path.exists() and not args.force_recompute_latent_stats:
         payload = torch.load(stats_path, map_location="cpu")
-        print(f"Loaded illumination latent stats from {stats_path}")
+        log(f"Loaded illumination latent stats from {stats_path}")
     else:
         lock_path = stats_path.with_name(f"{stats_path.name}.lock")
         lock_fd = acquire_file_lock(lock_path)
         try:
             if stats_path.exists() and not args.force_recompute_latent_stats:
                 payload = torch.load(stats_path, map_location="cpu")
-                print(f"Loaded illumination latent stats from {stats_path}")
+                log(f"Loaded illumination latent stats from {stats_path}")
             else:
-                print(f"Computing illumination latent stats: {stats_path}")
+                log(f"Computing illumination latent stats: {stats_path}")
                 payload = compute_illumination_latent_stats(
                     pipe,
                     rows,
@@ -324,7 +453,7 @@ def load_or_compute_latent_stats(
                     writer=writer,
                 )
                 atomic_torch_save(payload, stats_path)
-                print(f"Saved illumination latent stats to {stats_path}")
+                log(f"Saved illumination latent stats to {stats_path}")
         finally:
             release_file_lock(lock_fd, lock_path)
     mean = payload["mean"].float()
@@ -418,76 +547,121 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    data_root = repo_path(args.data_root)
-    rows = select_rows(args)
-    output_dir = Path(args.output_dir or f"model/train/illum_head_{args.target}_{args.arch}")
-    output_dir = repo_path(output_dir)
-    if args.append_timestamp:
-        output_dir = Path(f"{str(output_dir).rstrip('/')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    weights = tuple(float(item) for item in str(args.multiscale_weights).split(",") if item.strip())
-    config = IlluminationLatentHeadConfig(
-        latent_channels=args.latent_channels,
-        target=args.target,
-        arch=args.arch,
-        hidden_channels=args.hidden_channels,
-        mid_channels=args.mid_channels,
-        bottleneck_channels=args.bottleneck_channels,
-        lite_blocks=args.lite_blocks,
-        eps=args.eps,
-        normalize_loss=args.normalize_latent_loss,
-        loss_type=args.loss_type,
-        cosine_weight=args.cosine_weight,
-        multiscale_weights=weights,
-    )
-    latent_stats_path = None
-    if args.normalize_latent_loss:
-        latent_stats_path = repo_path(args.latent_stats_path) if args.latent_stats_path else default_latent_stats_path(data_root, args)
-    save_json(
-        output_dir / "train_config.json",
-        {
-            "args": vars(args),
-            "data_root": data_root.as_posix(),
-            "row_count": len(rows),
-            "head_config": config.to_dict(),
-            "latent_stats_path": latent_stats_path.as_posix() if latent_stats_path else None,
-        },
-    )
-
-    dataset = IlluminationImageDataset(
-        rows,
-        data_root=data_root,
-        image_key=args.image_key,
-        width=args.width,
-        height=args.height,
-    )
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_images,
-        drop_last=True,
-    )
-    pipe = load_vae_pipe(args)
-    writer = maybe_writer(output_dir, args.enable_tensorboard)
-    latent_mean, latent_std, latent_stats_info = load_or_compute_latent_stats(
-        pipe,
-        rows,
-        data_root=data_root,
-        config=config,
-        args=args,
-        writer=writer,
-    )
-    head = build_illumination_latent_head(config).to(device=pipe.device, dtype=torch.float32)
-    head.train()
-    optimizer = torch.optim.AdamW(head.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-
-    global_step = 0
+    dist_info = setup_distributed(args)
+    writer = None
     try:
+        data_root = repo_path(args.data_root)
+        rows = select_rows(args)
+        output_dir = Path(args.output_dir or f"model/train/illum_head_{args.target}_{args.arch}")
+        output_dir = repo_path(output_dir)
+        if args.append_timestamp:
+            output_dir = Path(f"{str(output_dir).rstrip('/')}_{broadcast_run_timestamp()}")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        weights = tuple(float(item) for item in str(args.multiscale_weights).split(",") if item.strip())
+        config = IlluminationLatentHeadConfig(
+            latent_channels=args.latent_channels,
+            target=args.target,
+            arch=args.arch,
+            hidden_channels=args.hidden_channels,
+            mid_channels=args.mid_channels,
+            bottleneck_channels=args.bottleneck_channels,
+            lite_blocks=args.lite_blocks,
+            eps=args.eps,
+            normalize_loss=args.normalize_latent_loss,
+            loss_type=args.loss_type,
+            cosine_weight=args.cosine_weight,
+            multiscale_weights=weights,
+        )
+        latent_stats_path = None
+        if args.normalize_latent_loss:
+            latent_stats_path = (
+                repo_path(args.latent_stats_path)
+                if args.latent_stats_path
+                else default_latent_stats_path(data_root, args)
+            )
+        if is_main_process():
+            save_json(
+                output_dir / "train_config.json",
+                {
+                    "args": vars(args),
+                    "data_root": data_root.as_posix(),
+                    "row_count": len(rows),
+                    "head_config": config.to_dict(),
+                    "latent_stats_path": latent_stats_path.as_posix() if latent_stats_path else None,
+                    "distributed": dist_info,
+                    "per_gpu_batch_size": int(args.batch_size),
+                    "effective_global_batch_size": int(args.batch_size) * distributed_world_size(),
+                },
+            )
+
+        dataset = IlluminationImageDataset(
+            rows,
+            data_root=data_root,
+            image_key=args.image_key,
+            width=args.width,
+            height=args.height,
+        )
+        sampler = (
+            DistributedSampler(
+                dataset,
+                num_replicas=distributed_world_size(),
+                rank=distributed_rank(),
+                shuffle=True,
+                seed=int(args.shuffle_seed or 0),
+                drop_last=True,
+            )
+            if distributed_is_initialized()
+            else None
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=sampler is None,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            collate_fn=collate_images,
+            drop_last=True,
+        )
+        pipe = load_vae_pipe(args)
+        writer = maybe_writer(output_dir, args.enable_tensorboard and is_main_process())
+        latent_mean, latent_std, latent_stats_info = load_or_compute_latent_stats(
+            pipe,
+            rows,
+            data_root=data_root,
+            config=config,
+            args=args,
+            writer=writer,
+        )
+        head = build_illumination_latent_head(config).to(device=pipe.device, dtype=torch.float32)
+        head.train()
+        if distributed_is_initialized():
+            ddp_kwargs: dict[str, Any] = {}
+            if pipe.device.type == "cuda":
+                ddp_kwargs = {
+                    "device_ids": [distributed_local_rank()],
+                    "output_device": distributed_local_rank(),
+                }
+            head = DistributedDataParallel(head, **ddp_kwargs)
+        optimizer = torch.optim.AdamW(head.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+        log(
+            "Illumination head training: "
+            f"arch={args.arch}, target={args.target}, size={args.width}x{args.height}, "
+            f"device={args.device}, world_size={distributed_world_size()}, "
+            f"per_gpu_batch_size={args.batch_size}, "
+            f"effective_global_batch_size={int(args.batch_size) * distributed_world_size()}"
+        )
+
+        global_step = 0
         for epoch in range(int(args.num_epochs)):
-            iterator = tqdm(dataloader, desc=f"illum {args.target}/{args.arch} epoch {epoch}")
+            if sampler is not None:
+                sampler.set_epoch(epoch)
+            iterator = tqdm(
+                dataloader,
+                desc=f"illum {args.target}/{args.arch} epoch {epoch}",
+                disable=not is_main_process(),
+            )
             for images in iterator:
                 rgb_vae = preprocess_batch(pipe, images, min_value=-1, max_value=1)
                 rgb_unit = preprocess_batch(pipe, images, min_value=0, max_value=1)
@@ -513,17 +687,19 @@ def main() -> None:
                 optimizer.step()
 
                 global_step += 1
-                loss_value = float(loss.detach().cpu())
-                iterator.set_postfix(loss=f"{loss_value:.5f}", step=global_step)
-                if writer is not None:
+                averaged_metrics = average_metric_tensors(metrics)
+                loss_value = float(averaged_metrics["loss"].detach().cpu())
+                if is_main_process():
+                    iterator.set_postfix(loss=f"{loss_value:.5f}", step=global_step)
+                if writer is not None and is_main_process():
                     writer.add_scalar("train/loss", loss_value, global_step)
-                    for key, value in metrics.items():
+                    for key, value in averaged_metrics.items():
                         writer.add_scalar(f"train/{key}", float(value.cpu()), global_step)
                     writer.add_scalar("train/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-                if args.save_steps and global_step % int(args.save_steps) == 0:
+                if args.save_steps and global_step % int(args.save_steps) == 0 and is_main_process():
                     save_illumination_head_checkpoint(
                         output_dir / f"step-{global_step}.safetensors",
-                        head,
+                        unwrap_head(head),
                         config,
                         latent_mean=latent_mean,
                         latent_std=latent_std,
@@ -535,33 +711,35 @@ def main() -> None:
                     )
                 if args.max_steps is not None and global_step >= int(args.max_steps):
                     break
+            if is_main_process():
+                save_illumination_head_checkpoint(
+                    output_dir / f"epoch-{epoch}.safetensors",
+                    unwrap_head(head),
+                    config,
+                    latent_mean=latent_mean,
+                    latent_std=latent_std,
+                    extra={
+                        "global_step": global_step,
+                        "epoch": epoch,
+                        "latent_stats": latent_stats_metadata(latent_stats_info),
+                    },
+                )
+            if args.max_steps is not None and global_step >= int(args.max_steps):
+                break
+        if is_main_process():
             save_illumination_head_checkpoint(
-                output_dir / f"epoch-{epoch}.safetensors",
-                head,
+                output_dir / "final.safetensors",
+                unwrap_head(head),
                 config,
                 latent_mean=latent_mean,
                 latent_std=latent_std,
-                extra={
-                    "global_step": global_step,
-                    "epoch": epoch,
-                    "latent_stats": latent_stats_metadata(latent_stats_info),
-                },
+                extra={"global_step": global_step, "latent_stats": latent_stats_metadata(latent_stats_info)},
             )
-            if args.max_steps is not None and global_step >= int(args.max_steps):
-                break
+            log(f"Saved illumination head to {output_dir / 'final.safetensors'}")
     finally:
         if writer is not None:
             writer.close()
-
-    save_illumination_head_checkpoint(
-        output_dir / "final.safetensors",
-        head,
-        config,
-        latent_mean=latent_mean,
-        latent_std=latent_std,
-        extra={"global_step": global_step, "latent_stats": latent_stats_metadata(latent_stats_info)},
-    )
-    print(f"Saved illumination head to {output_dir / 'final.safetensors'}")
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
